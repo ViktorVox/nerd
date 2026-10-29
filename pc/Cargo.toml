@@ -11,6 +11,7 @@ features = [
     "Win32_UI_Controls",
     "Win32_UI_Input_Pointer",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
 ]
 
 [profile.release]
