@@ -85,7 +85,7 @@ impl Dxgi {
             device.CreateTexture2D(&desc, None, Some(&mut staging)).ok()?;
 
             let mut me = Self { ctx, dup, last: last?, staging: staging?, w, h, have_image: false };
-            // Настоящая картинка приходит после первой перерисовки; на неподвижном экране её нет — берём снимок
+            // Настоящая картинка приходит после первой перерисовки; на неподвижном экране её нет - берём снимок
             let started = std::time::Instant::now();
             while !me.have_image && started.elapsed() < std::time::Duration::from_millis(150) {
                 me.refresh(50)?;

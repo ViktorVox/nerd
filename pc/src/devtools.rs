@@ -1,4 +1,4 @@
-// Проверки без телефона (запуск с --demo или --probe): вывод идёт в консоль, из которой запущена программа
+// Проверки без устройства (запуск с --demo или --probe): вывод идёт в консоль, из которой запущена программа
 use crate::monitors;
 use crate::pen::{Packet, Pen, DOWN, DRAG, HOVER, LEAVE, UP};
 use std::time::Duration;

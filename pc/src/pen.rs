@@ -5,7 +5,7 @@ use windows::Win32::UI::Controls::{
     POINTER_TYPE_INFO_0,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
     MOUSE_EVENT_FLAGS,
 };
@@ -181,8 +181,29 @@ fn mouse_move(px: i32, py: i32) {
     send_mouse(dx, dy, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK);
 }
 
+// Устройству можно нажимать только клавиши, нужные для рисования и работы с холстом; Win и системные не пропускаем
+fn key_allowed(vk: u16) -> bool {
+    matches!(vk, 0x08 | 0x09 | 0x0D | 0x10 | 0x11 | 0x12 | 0x1B | 0x20 | 0x2E | 0x30..=0x39 | 0x41..=0x5A | 0xBB..=0xC0 | 0xDB..=0xDD)
+}
+
+fn send_key(vk: u16, down: bool) {
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: 0,
+                dwFlags: if down { Default::default() } else { KEYEVENTF_KEYUP },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+}
+
 // Формат команд: CMD_MAGIC | kind u8 | код сессии u16 | ...
-// kind 0: x f32, y f32 (курсор); kind 1: кнопка u8 (0 левая, 1 правая), down u8
+// kind 0: x f32, y f32 (курсор); kind 1: кнопка u8 (0 левая, 1 правая), down u8; kind 2: клавиша vk u16, down u8
 pub fn command(buf: &[u8]) {
     let f = |i: usize| f32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
     match buf.get(1) {
@@ -199,6 +220,12 @@ pub fn command(buf: &[u8]) {
                 _ => return,
             };
             send_mouse(0, 0, flag);
+        }
+        Some(2) if buf.len() >= 7 => {
+            let vk = u16::from_le_bytes([buf[4], buf[5]]);
+            if key_allowed(vk) {
+                send_key(vk, buf[6] != 0);
+            }
         }
         _ => {}
     }

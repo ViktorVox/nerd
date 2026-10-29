@@ -40,7 +40,7 @@ pub fn single_instance() -> bool {
     }
 }
 
-// Меняет подпись значка; balloon — всплывающее уведомление
+// Меняет подпись значка; balloon - всплывающее уведомление
 pub fn set_status(connected: bool, text: &str, balloon: Option<String>) {
     *STATUS.lock().unwrap() = Status { connected, text: text.to_string(), balloon };
     let h = HWND_RAW.load(Ordering::SeqCst);
@@ -53,7 +53,7 @@ pub fn set_status(connected: bool, text: &str, balloon: Option<String>) {
 
 fn status_text() -> String {
     let s = STATUS.lock().unwrap();
-    if s.text.is_empty() { "Ждёт телефон".into() } else { s.text.clone() }
+    if s.text.is_empty() { "Ждёт устройство".into() } else { s.text.clone() }
 }
 
 fn copy(dst: &mut [u16], s: &str) {
@@ -78,7 +78,7 @@ unsafe fn notify(hwnd: HWND, op: windows::Win32::UI::Shell::NOTIFY_ICON_MESSAGE,
     d.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     d.uCallbackMessage = WM_TRAY;
     d.hIcon = icon();
-    copy(&mut d.szTip, &format!("Nerd — {}", status_text()));
+    copy(&mut d.szTip, &format!("Nerd - {}", status_text()));
     if let Some(text) = balloon {
         d.uFlags |= NIF_INFO;
         copy(&mut d.szInfoTitle, "Nerd");
@@ -99,7 +99,7 @@ pub fn run_action(action: Action) {
         Action::ToggleAutostart => settings::set_autostart(!settings::autostart()),
         Action::ForgetPhones => {
             auth::forget_all();
-            set_status(false, "Ждёт телефон", Some("Все телефоны забыты: при подключении снова спросим разрешение".into()));
+            set_status(false, "Ждёт устройство", Some("Все устройства забыты: при подключении снова спросим разрешение".into()));
         }
         Action::Exit => {
             let h = HWND_RAW.load(Ordering::SeqCst);

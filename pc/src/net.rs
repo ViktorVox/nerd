@@ -1,4 +1,4 @@
-// Сетевая часть: перо и мышь по UDP, экран по TCP, поиск ПК телефоном
+// Сетевая часть: перо и мышь по UDP, экран по TCP, поиск ПК устройством
 use crate::auth;
 use crate::capture::{capture_gdi, encode_jpeg};
 use crate::dxgi::Dxgi;
@@ -30,7 +30,7 @@ pub fn serve_udp() {
     loop {
         match sock.recv_from(&mut buf) {
             Ok((n, from)) => {
-                // байты 2-3 каждого пакета — код сессии, выданный ПК после подтверждения
+                // байты 2-3 каждого пакета - код сессии, выданный ПК после подтверждения
                 if n < 4 || !auth::session_ok(from.ip(), u16::from_le_bytes([buf[2], buf[3]])) {
                     continue;
                 }
@@ -45,6 +45,16 @@ pub fn serve_udp() {
     }
 }
 
+// Положение курсора Windows в долях монитора; за пределами монитора - (-1, -1)
+fn cursor_fraction((x0, y0, w, h): Rect) -> (f32, f32) {
+    let mut p = windows::Win32::Foundation::POINT::default();
+    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p) }.is_err() {
+        return (-1.0, -1.0);
+    }
+    let (fx, fy) = ((p.x - x0) as f32 / w as f32, (p.y - y0) as f32 / h as f32);
+    if (0.0..=1.0).contains(&fx) && (0.0..=1.0).contains(&fy) { (fx, fy) } else { (-1.0, -1.0) }
+}
+
 fn seed(r: Rect) -> impl FnOnce() -> Option<Vec<u8>> {
     move || capture_gdi(r.0, r.1, r.2, r.3, r.2, r.3)
 }
@@ -55,13 +65,13 @@ impl Drop for Guard {
     fn drop(&mut self) {
         auth::end_session(self.0);
         if CLIENTS.fetch_sub(1, Ordering::SeqCst) == 1 {
-            crate::tray::set_status(false, "Ждёт телефон", None);
+            crate::tray::set_status(false, "Ждёт устройство", None);
         }
     }
 }
 
-// Приветствие: "NERD" | версия 2 | id телефона 16 байт | ключ 16 байт | длина имени u8 | имя.
-// Ответ ПК: 0 — отказ; 1 | код сессии u16 | текущий монитор u8 | число мониторов u8 | (номер u8, ширина u16, высота u16)...
+// Приветствие: "NERD" | версия 2 | id устройства 16 байт | ключ 16 байт | длина имени u8 | имя.
+// Ответ ПК: 0 - отказ; 1 | код сессии u16 | текущий монитор u8 | число мониторов u8 | (номер u8, ширина u16, высота u16)...
 fn handshake(s: &mut TcpStream, ip: std::net::IpAddr) -> std::io::Result<Option<String>> {
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut h = [0u8; 38];
@@ -83,9 +93,10 @@ fn handshake(s: &mut TcpStream, ip: std::net::IpAddr) -> std::io::Result<Option<
     Ok(Some(name))
 }
 
-// Дальше запросы телефона: тип u8. 0 — кадр (24 байта): x f32, y f32, w f32, h f32 (доли монитора) |
-// out_w u16, out_h u16 | quality u8 | 3 байта. 1 — выбрать монитор (номер u8).
-// Ответ на кадр: x f32, y f32, w f32, h f32 | mon_w u16, mon_h u16 | len u32 | jpeg
+// Дальше запросы устройства: тип u8. 0 - кадр (24 байта): x f32, y f32, w f32, h f32 (доли монитора) |
+// out_w u16, out_h u16 | quality u8 | 3 байта. 1 - выбрать монитор (номер u8).
+// Ответ на кадр: x f32, y f32, w f32, h f32 | mon_w u16, mon_h u16 | len u32 | курсор x f32, y f32 | jpeg
+// (курсор - доли монитора, меньше нуля - вне монитора)
 fn serve_client(mut s: TcpStream) -> std::io::Result<()> {
     s.set_nodelay(true)?;
     let ip = s.peer_addr()?.ip();
@@ -94,8 +105,8 @@ fn serve_client(mut s: TcpStream) -> std::io::Result<()> {
     let tag = auth::start_session(ip);
     let _guard = Guard(tag);
     CLIENTS.fetch_add(1, Ordering::SeqCst);
-    crate::tray::set_status(true, &format!("Подключён: {name}"), Some(format!("Подключён: {name}")));
-    log!("подключён «{name}» {ip}");
+    crate::tray::set_status(true, &format!("Подключено: {name}"), Some(format!("Подключено: {name}")));
+    log!("подключено «{name}» {ip}");
 
     let mons = monitors::list();
     let mut reply = vec![1u8];
@@ -175,13 +186,16 @@ fn serve_client(mut s: TcpStream) -> std::io::Result<()> {
             );
             (frames, spent, bytes, since, cap_spent) = (0, Duration::ZERO, 0, Instant::now(), Duration::ZERO);
         }
-        let mut head = Vec::with_capacity(24);
+        let mut head = Vec::with_capacity(32);
         for v in [rx, ry, rw, rh] {
             head.extend_from_slice(&v.to_le_bytes());
         }
         head.extend_from_slice(&(w as u16).to_le_bytes());
         head.extend_from_slice(&(h as u16).to_le_bytes());
         head.extend_from_slice(&(jpeg.len() as u32).to_le_bytes());
+        let (cx, cy) = cursor_fraction(mon);
+        head.extend_from_slice(&cx.to_le_bytes());
+        head.extend_from_slice(&cy.to_le_bytes());
         s.write_all(&head)?;
         s.write_all(&jpeg)?;
     }
@@ -200,10 +214,10 @@ pub fn serve_screen() {
     }
 }
 
-// Телефон рассылает «NERD?» по локальной сети, ПК отвечает «NERD!» и своим именем
+// Устройство рассылает «NERD?» по локальной сети, ПК отвечает «NERD!» и своим именем
 pub fn serve_discovery() {
     let Ok(sock) = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) else {
-        log!("порт поиска {DISCOVERY_PORT} занят: телефон не найдёт ПК сам");
+        log!("порт поиска {DISCOVERY_PORT} занят: устройство не найдёт ПК само");
         return;
     };
     let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "ПК".into());

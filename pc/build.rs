@@ -4,7 +4,7 @@ fn main() {
         res.set_icon("assets/nerd.ico");
         res.set_manifest_file("assets/nerd.manifest");
         res.set("ProductName", "Nerd");
-        res.set("FileDescription", "Nerd — телефон как графический планшет");
+        res.set("FileDescription", "Nerd - превращает устройство в графический планшет");
         res.compile().expect("не удалось встроить иконку и манифест");
     }
 }

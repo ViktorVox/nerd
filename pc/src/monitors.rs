@@ -1,4 +1,4 @@
-// Мониторы и выбор того, который показывается на телефоне
+// Мониторы и выбор того, который показывается на устройстве
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use windows::Win32::Foundation::{LPARAM, RECT};
@@ -46,7 +46,7 @@ static SELECTED: Mutex<Option<u32>> = Mutex::new(None);
 static RECT_NOW: Mutex<Rect> = Mutex::new((0, 0, 1920, 1080));
 static GENERATION: AtomicU32 = AtomicU32::new(0);
 
-// None — основной монитор Windows
+// None - основной монитор Windows
 pub fn select(num: Option<u32>) {
     let all = list();
     let chosen = num

@@ -3,6 +3,7 @@
 mod auth;
 mod capture;
 mod devtools;
+mod dialog;
 mod dxgi;
 mod log;
 mod menu;
@@ -11,6 +12,7 @@ mod net;
 mod pen;
 mod settings;
 mod tray;
+mod ui;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
