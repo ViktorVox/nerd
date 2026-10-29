@@ -1,10 +1,14 @@
-use std::net::UdpSocket;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::time::Duration;
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
+    GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, COLORONCOLOR, DIB_RGB_COLORS, HALFTONE, HDC, HMONITOR, MONITORINFO,
+    MONITORINFOEXW, SRCCOPY,
 };
 use windows::Win32::UI::Controls::{
     CreateSyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
@@ -31,6 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::BOOL;
 
 const PORT: u16 = 47800;
+const SCREEN_PORT: u16 = 47801;
 const MAGIC: u8 = 0x4E;
 const CMD_MAGIC: u8 = 0x4F;
 const PACKET_LEN: usize = 20;
@@ -325,6 +330,85 @@ fn command(pen: &Pen, buf: &[u8]) {
     }
 }
 
+// Снимок области монитора, уменьшенный/увеличенный до ow x oh, в JPEG
+fn capture_jpeg(sx: i32, sy: i32, sw: i32, sh: i32, ow: i32, oh: i32, quality: u8) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; (ow * oh * 4) as usize];
+    unsafe {
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(Some(screen));
+        let bmp = CreateCompatibleBitmap(screen, ow, oh);
+        let old = SelectObject(mem, bmp.into());
+        SetStretchBltMode(mem, if sw > ow { HALFTONE } else { COLORONCOLOR });
+        let ok = StretchBlt(mem, 0, 0, ow, oh, Some(screen), sx, sy, sw, sh, SRCCOPY).as_bool();
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: ow,
+            biHeight: -oh,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        let lines = GetDIBits(mem, bmp, 0, oh as u32, Some(buf.as_mut_ptr() as *mut _), &mut bmi, DIB_RGB_COLORS);
+        SelectObject(mem, old);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+        if !ok || lines == 0 {
+            return None;
+        }
+    }
+    let mut out = Vec::with_capacity(64 * 1024);
+    jpeg_encoder::Encoder::new(&mut out, quality)
+        .encode(&buf, ow as u16, oh as u16, jpeg_encoder::ColorType::Bgra)
+        .ok()?;
+    Some(out)
+}
+
+// Запрос (24 байта): x f32, y f32, w f32, h f32 (доли монитора) | out_w u16, out_h u16 | quality u8 | 3 байта
+// Ответ: x f32, y f32, w f32, h f32 | mon_w u16, mon_h u16 | len u32 | jpeg
+fn serve_client(mut s: TcpStream, mon: (i32, i32, i32, i32)) -> std::io::Result<()> {
+    s.set_nodelay(true)?;
+    let (x0, y0, w, h) = mon;
+    let mut req = [0u8; 24];
+    loop {
+        s.read_exact(&mut req)?;
+        let f = |i: usize| f32::from_le_bytes(req[i..i + 4].try_into().unwrap());
+        let (rx, ry) = (f(0).clamp(0.0, 1.0), f(4).clamp(0.0, 1.0));
+        let (rw, rh) = (f(8).clamp(0.0, 1.0 - rx), f(12).clamp(0.0, 1.0 - ry));
+        let ow = (u16::from_le_bytes([req[16], req[17]]) as i32).clamp(16, 3840);
+        let oh = (u16::from_le_bytes([req[18], req[19]]) as i32).clamp(16, 2160);
+        let quality = req[20].clamp(10, 95);
+        let sx = x0 + (rx * w as f32) as i32;
+        let sy = y0 + (ry * h as f32) as i32;
+        let sw = ((rw * w as f32) as i32).max(1);
+        let sh = ((rh * h as f32) as i32).max(1);
+        let Some(jpeg) = capture_jpeg(sx, sy, sw, sh, ow, oh, quality) else {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        let mut head = Vec::with_capacity(28);
+        for v in [rx, ry, rw, rh] {
+            head.extend_from_slice(&v.to_le_bytes());
+        }
+        head.extend_from_slice(&(w as u16).to_le_bytes());
+        head.extend_from_slice(&(h as u16).to_le_bytes());
+        head.extend_from_slice(&(jpeg.len() as u32).to_le_bytes());
+        s.write_all(&head)?;
+        s.write_all(&jpeg)?;
+    }
+}
+
+fn serve_screen(mon: (i32, i32, i32, i32)) {
+    let listener = TcpListener::bind(("0.0.0.0", SCREEN_PORT)).expect("порт экрана занят");
+    for stream in listener.incoming().flatten() {
+        std::thread::spawn(move || {
+            let _ = serve_client(stream, mon);
+        });
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let monitor = args.iter().position(|a| a == "--monitor").and_then(|i| args.get(i + 1)?.parse().ok());
@@ -352,8 +436,10 @@ fn main() {
         return;
     }
 
+    let mon = (pen.x0, pen.y0, pen.w, pen.h);
+    std::thread::spawn(move || serve_screen(mon));
     let sock = UdpSocket::bind(("0.0.0.0", PORT)).expect("порт занят");
-    println!("Слушаю UDP :{PORT}. Экран {}x{}", pen.w, pen.h);
+    println!("Слушаю UDP :{PORT}, экран по TCP :{SCREEN_PORT}. Монитор {}x{}", pen.w, pen.h);
     let mut buf = [0u8; 64];
     loop {
         match sock.recv_from(&mut buf) {

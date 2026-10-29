@@ -2,9 +2,12 @@ package ru.nerd
 
 import android.app.Activity
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import android.os.Bundle
 import android.view.Gravity
 import android.view.MotionEvent
@@ -15,7 +18,10 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.io.DataInputStream
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.LinkedBlockingQueue
@@ -25,6 +31,8 @@ import kotlin.math.min
 import kotlin.math.sin
 
 private const val PORT = 47800
+private const val SCREEN_PORT = 47801
+private const val JPEG_QUALITY = 60
 private const val MAGIC: Byte = 0x4E
 private const val CMD_MAGIC: Byte = 0x4F
 
@@ -75,14 +83,67 @@ class Sender(host: String) {
     }
 }
 
+// Кадр экрана ПК и область монитора (доли 0..1), которую он показывает
+class Frame(val bmp: Bitmap, val x: Float, val y: Float, val w: Float, val h: Float)
+
+class ScreenClient(private val host: String, private val pad: PadView) {
+    @Volatile private var running = true
+    @Volatile private var socket: Socket? = null
+
+    init {
+        Thread { loop() }.apply { isDaemon = true; start() }
+    }
+
+    fun stop() {
+        running = false
+        socket?.close()
+    }
+
+    private fun loop() {
+        while (running) {
+            val s = Socket()
+            try {
+                socket = s
+                s.tcpNoDelay = true
+                s.connect(InetSocketAddress(host, SCREEN_PORT), 3000)
+                val input = DataInputStream(s.getInputStream().buffered(1 shl 16))
+                val out = s.getOutputStream()
+                val head = ByteArray(24)
+                while (running) {
+                    out.write(pad.screenRequest())
+                    out.flush()
+                    input.readFully(head)
+                    val b = ByteBuffer.wrap(head).order(ByteOrder.LITTLE_ENDIAN)
+                    val x = b.float; val y = b.float; val w = b.float; val h = b.float
+                    val monW = b.short.toInt() and 0xFFFF
+                    val monH = b.short.toInt() and 0xFFFF
+                    val len = b.int
+                    if (len <= 0 || len > 20_000_000) break
+                    val data = ByteArray(len)
+                    input.readFully(data)
+                    val bmp = BitmapFactory.decodeByteArray(data, 0, len)
+                    if (bmp != null) pad.onFrame(Frame(bmp, x, y, w, h), monW.toFloat(), monH.toFloat())
+                }
+            } catch (e: Exception) {
+                // нет связи: пробуем снова
+            } finally {
+                runCatching { s.close() }
+            }
+            if (running) Thread.sleep(1000)
+        }
+    }
+}
+
 enum class Mode(val title: String) { DRAW("Рисовать"), MOUSE("Мышь") }
 
 class PadView(context: Context, private val sender: Sender) : View(context) {
     var mode = Mode.DRAW
 
     // Размер монитора ПК; позже придёт от ПК вместе с картинкой
-    private val monW = 1920f
-    private val monH = 1080f
+    private var monW = 1920f
+    private var monH = 1080f
+
+    @Volatile private var frame: Frame? = null
 
     // Вид: scale — пикселей экрана на пиксель монитора; (ox, oy) — точка монитора в левом верхнем углу экрана
     private var scale = 1f
@@ -105,9 +166,10 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
     private var moved = false
 
     private val grid = Paint().apply { color = Color.rgb(60, 60, 70); strokeWidth = 1f }
-    private val frame = Paint().apply {
+    private val border = Paint().apply {
         color = Color.rgb(120, 120, 140); strokeWidth = 3f; style = Paint.Style.STROKE
     }
+    private val bitmapPaint = Paint().apply { isFilterBitmap = true }
     private val text = Paint().apply { color = Color.WHITE; textSize = 32f; isAntiAlias = true }
 
     fun fit() {
@@ -116,6 +178,29 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
         ox = -(width / scale - monW) / 2
         oy = -(height / scale - monH) / 2
         invalidate()
+    }
+
+    // Запрос к ПК (24 байта): видимая область монитора и размер картинки в пикселях экрана
+    fun screenRequest(): ByteArray {
+        val x0 = ox.coerceAtLeast(0f)
+        val y0 = oy.coerceAtLeast(0f)
+        val x1 = (ox + width / scale).coerceAtMost(monW)
+        val y1 = (oy + height / scale).coerceAtMost(monH)
+        val b = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
+        b.putFloat(x0 / monW).putFloat(y0 / monH).putFloat((x1 - x0) / monW).putFloat((y1 - y0) / monH)
+        b.putShort(((x1 - x0) * scale).toInt().coerceIn(16, 2560).toShort())
+        b.putShort(((y1 - y0) * scale).toInt().coerceIn(16, 1440).toShort())
+        b.put(JPEG_QUALITY.toByte())
+        return b.array()
+    }
+
+    fun onFrame(f: Frame, w: Float, h: Float) {
+        frame = f
+        if (w != monW || h != monH) {
+            monW = w; monH = h
+            post { fit() }
+        }
+        postInvalidate()
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) = fit()
@@ -133,7 +218,14 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
             val y = (i * monH / 9 - oy) * scale
             c.drawLine(0f, y, width.toFloat(), y, grid)
         }
-        c.drawRect(-ox * scale, -oy * scale, (monW - ox) * scale, (monH - oy) * scale, frame)
+        frame?.let {
+            val dst = RectF(
+                (it.x * monW - ox) * scale, (it.y * monH - oy) * scale,
+                ((it.x + it.w) * monW - ox) * scale, ((it.y + it.h) * monH - oy) * scale,
+            )
+            c.drawBitmap(it.bmp, null, dst, bitmapPaint)
+        }
+        c.drawRect(-ox * scale, -oy * scale, (monW - ox) * scale, (monH - oy) * scale, border)
         c.drawText("Увеличение ×%.1f".format(scale / fitScale), 24f, height - 24f, text)
     }
 
@@ -251,6 +343,13 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
 }
 
 class MainActivity : Activity() {
+    private var screen: ScreenClient? = null
+
+    override fun onDestroy() {
+        screen?.stop()
+        super.onDestroy()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val prefs = getSharedPreferences("nerd", MODE_PRIVATE)
@@ -272,12 +371,13 @@ class MainActivity : Activity() {
             val host = ip.text.toString().trim()
             if (host.isEmpty()) return@setOnClickListener
             prefs.edit().putString("ip", host).apply()
-            showPad(Sender(host))
+            showPad(host)
         }
     }
 
-    private fun showPad(sender: Sender) {
-        val pad = PadView(this, sender)
+    private fun showPad(host: String) {
+        val pad = PadView(this, Sender(host))
+        screen = ScreenClient(host, pad)
         val modeButton = Button(this).apply { text = pad.mode.title }
         modeButton.setOnClickListener {
             pad.mode = if (pad.mode == Mode.DRAW) Mode.MOUSE else Mode.DRAW
