@@ -1,7 +1,15 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+// Ключ подписи релиза хранится вне репозитория: путь к файлу настроек задаётся в NERD_KEYSTORE_PROPS
+val keystoreProps = Properties().apply {
+    val path = System.getenv("NERD_KEYSTORE_PROPS")
+    if (path != null && file(path).exists()) file(path).inputStream().use { load(it) }
 }
 
 android {
@@ -14,6 +22,26 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+    }
+
+    signingConfigs {
+        if (!keystoreProps.isEmpty) {
+            create("release") {
+                storeFile = file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            if (!keystoreProps.isEmpty) signingConfig = signingConfigs.getByName("release")
+        }
     }
 
     compileOptions {

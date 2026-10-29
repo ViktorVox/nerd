@@ -3,6 +3,10 @@ name = "nerd-pc"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "Nerd"
+path = "src/main.rs"
+
 [dependencies]
 jpeg-encoder = "0.6"
 
