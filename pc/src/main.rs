@@ -1,3 +1,5 @@
+mod dxgi;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::time::Duration;
@@ -339,9 +341,8 @@ fn command(pen: &Pen, buf: &[u8]) {
     }
 }
 
-// Снимок области монитора, уменьшенный/увеличенный до ow x oh, в JPEG
-fn capture_jpeg(sx: i32, sy: i32, sw: i32, sh: i32, ow: i32, oh: i32, quality: u8) -> Option<(Vec<u8>, Duration)> {
-    let t0 = std::time::Instant::now();
+// Запасной способ: снимок области монитора средствами GDI, ow x oh, пиксели BGRA
+fn capture_gdi(sx: i32, sy: i32, sw: i32, sh: i32, ow: i32, oh: i32) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; (ow * oh * 4) as usize];
     unsafe {
         let screen = GetDC(None);
@@ -369,13 +370,17 @@ fn capture_jpeg(sx: i32, sy: i32, sw: i32, sh: i32, ow: i32, oh: i32, quality: u
             return None;
         }
     }
-    let captured = t0.elapsed();
+    Some(buf)
+}
+
+fn encode_jpeg(buf: &[u8], ow: i32, oh: i32, quality: u8) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(64 * 1024);
     jpeg_encoder::Encoder::new(&mut out, quality)
-        .encode(&buf, ow as u16, oh as u16, jpeg_encoder::ColorType::Bgra)
+        .encode(buf, ow as u16, oh as u16, jpeg_encoder::ColorType::Bgra)
         .ok()?;
-    Some((out, captured))
+    Some(out)
 }
+
 
 // Запрос (24 байта): x f32, y f32, w f32, h f32 (доли монитора) | out_w u16, out_h u16 | quality u8 | 3 байта
 // Ответ: x f32, y f32, w f32, h f32 | mon_w u16, mon_h u16 | len u32 | jpeg
@@ -386,6 +391,9 @@ fn serve_client(mut s: TcpStream, mon: (i32, i32, i32, i32)) -> std::io::Result<
     let (mut frames, mut spent, mut bytes) = (0u32, Duration::ZERO, 0usize);
     let mut cap_spent = Duration::ZERO;
     let mut since = std::time::Instant::now();
+    let seed = || capture_gdi(x0, y0, w, h, w, h);
+    let mut gpu = dxgi::Dxgi::new(mon, seed);
+    println!("захват экрана: {}", if gpu.is_some() { "видеокарта (DXGI)" } else { "GDI" });
     loop {
         s.read_exact(&mut req)?;
         let f = |i: usize| f32::from_le_bytes(req[i..i + 4].try_into().unwrap());
@@ -399,7 +407,16 @@ fn serve_client(mut s: TcpStream, mon: (i32, i32, i32, i32)) -> std::io::Result<
         let sw = ((rw * w as f32) as i32).max(1);
         let sh = ((rh * h as f32) as i32).max(1);
         let t0 = std::time::Instant::now();
-        let Some((jpeg, cap)) = capture_jpeg(sx, sy, sw, sh, ow, oh, quality) else {
+        let shot = match gpu.as_mut().map(|g| g.grab(sx - x0, sy - y0, sw, sh, ow, oh)) {
+            Some(Some(buf)) => Some(buf),
+            Some(None) => {
+                gpu = dxgi::Dxgi::new(mon, seed);
+                capture_gdi(sx, sy, sw, sh, ow, oh)
+            }
+            None => capture_gdi(sx, sy, sw, sh, ow, oh),
+        };
+        let cap = t0.elapsed();
+        let Some(jpeg) = shot.and_then(|buf| encode_jpeg(&buf, ow, oh, quality)) else {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         };
