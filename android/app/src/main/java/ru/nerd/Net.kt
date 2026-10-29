@@ -22,7 +22,30 @@ import java.util.concurrent.Semaphore
 internal const val PORT = 47800
 internal const val SCREEN_PORT = 47801
 internal const val DISCOVERY_PORT = 47802
-internal const val JPEG_QUALITY = 60
+
+// Настройки, которые меняются на экране «Настройки»
+object AppSettings {
+    @Volatile var quality = 60
+    @Volatile var fingerPressure = 0.6f
+
+    fun load(prefs: android.content.SharedPreferences) {
+        quality = prefs.getInt("quality", 60)
+        fingerPressure = prefs.getFloat("finger_pressure", 0.6f)
+    }
+
+    fun save(prefs: android.content.SharedPreferences) {
+        prefs.edit().putInt("quality", quality).putFloat("finger_pressure", fingerPressure).apply()
+    }
+}
+
+// Коды клавиш Windows
+internal const val VK_CTRL = 0x11
+internal const val VK_SHIFT = 0x10
+internal const val VK_SPACE = 0x20
+internal const val VK_Z = 0x5A
+internal const val VK_E = 0x45
+internal const val VK_BRACKET_LEFT = 0xDB
+internal const val VK_BRACKET_RIGHT = 0xDD
 private const val MAGIC: Byte = 0x4E
 private const val CMD_MAGIC: Byte = 0x4F
 
@@ -33,7 +56,7 @@ internal const val DRAG: Byte = 2
 internal const val UP: Byte = 3
 internal const val LEAVE: Byte = 4
 
-// Сколько запросов кадра держим в полёте: ПК не ждёт, пока телефон закончит предыдущий
+// Сколько запросов кадра держим в полёте: ПК не ждёт, пока устройство закончит предыдущий
 private const val IN_FLIGHT = 2
 
 class Sender(host: String) {
@@ -68,6 +91,21 @@ class Sender(host: String) {
         queue.offer(b.array())
     }
 
+    // CMD_MAGIC | kind u8 (2: клавиша) | код сессии u16 | код клавиши Windows u16 | down u8
+    fun key(vk: Int, down: Boolean) {
+        queue.offer(byteArrayOf(CMD_MAGIC, 2, tag.toByte(), (tag shr 8).toByte(), vk.toByte(), (vk shr 8).toByte(), if (down) 1 else 0))
+    }
+
+    // Сочетание: клавиши нажимаются по порядку, отпускаются в обратном
+    fun combo(vararg keys: Int) {
+        keys.forEach { key(it, true) }
+        keys.reversed().forEach { key(it, false) }
+    }
+
+    fun undo() = combo(VK_CTRL, VK_Z)
+    fun redo() = combo(VK_CTRL, VK_SHIFT, VK_Z)
+    fun rotateCanvas(clockwise: Boolean) = combo(VK_CTRL, if (clockwise) VK_BRACKET_RIGHT else VK_BRACKET_LEFT)
+
     // CMD_MAGIC | kind u8 (1: кнопка) | код сессии u16 | кнопка u8 (0 левая, 1 правая) | down u8
     fun mouseButton(button: Int, down: Boolean) {
         queue.offer(byteArrayOf(CMD_MAGIC, 1, tag.toByte(), (tag shr 8).toByte(), button.toByte(), if (down) 1 else 0))
@@ -75,9 +113,18 @@ class Sender(host: String) {
 }
 
 // Кадр экрана ПК и область монитора (доли 0..1), которую он показывает
-class Frame(val bmp: Bitmap, val x: Float, val y: Float, val w: Float, val h: Float)
+class Frame(
+    val bmp: Bitmap,
+    val x: Float,
+    val y: Float,
+    val w: Float,
+    val h: Float,
+    // курсор Windows в долях монитора; меньше нуля - вне монитора
+    val cursorX: Float,
+    val cursorY: Float,
+)
 
-// Постоянные номер и ключ этого телефона: по ним ПК узнаёт, что телефон уже разрешён
+// Постоянные номер и ключ этого устройства: по ним ПК узнаёт, что устройство уже разрешено
 class Identity(val id: ByteArray, val token: ByteArray, val name: String) {
     companion object {
         fun load(prefs: android.content.SharedPreferences): Identity {
@@ -101,6 +148,7 @@ enum class ConnState { CONNECTING, WAITING, CONNECTED, DENIED }
 class MonitorOption(val num: Int, val w: Int, val h: Int)
 
 class ScreenClient(
+    context: Context,
     private val host: String,
     private val pad: PadView,
     private val sender: Sender,
@@ -118,6 +166,13 @@ class ScreenClient(
         private set
     @Volatile private var wantMonitor = -1
 
+    // Без этого Wi-Fi уходит в энергосбережение и добавляет к задержке десятки миллисекунд
+    private val wifiLock = runCatching {
+        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val mode = if (android.os.Build.VERSION.SDK_INT >= 29) WifiManager.WIFI_MODE_FULL_LOW_LATENCY else WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        wifi.createWifiLock(mode, "nerd").apply { setReferenceCounted(false); acquire() }
+    }.getOrNull()
+
     init {
         Thread { loop() }.apply { isDaemon = true; start() }
     }
@@ -125,6 +180,7 @@ class ScreenClient(
     fun stop() {
         running = false
         socket?.close()
+        runCatching { wifiLock?.release() }
     }
 
     // Выбор монитора на ПК; отправляется перед следующим запросом кадра
@@ -198,7 +254,7 @@ class ScreenClient(
                 }.apply { isDaemon = true; start() }
                 state = ConnState.CONNECTED
 
-                val head = ByteArray(24)
+                val head = ByteArray(32)
                 var frames = 0
                 var bytes = 0L
                 var rttSum = 0L
@@ -210,6 +266,7 @@ class ScreenClient(
                     val monW = b.short.toInt() and 0xFFFF
                     val monH = b.short.toInt() and 0xFFFF
                     val len = b.int
+                    val cursorX = b.float; val cursorY = b.float
                     if (len <= 0 || len > 20_000_000) break
                     val data = ByteArray(len)
                     input.readFully(data)
@@ -217,7 +274,7 @@ class ScreenClient(
                     slots.release()
                     val bmp = BitmapFactory.decodeByteArray(data, 0, len) ?: continue
                     val now = SystemClock.uptimeMillis()
-                    pad.onFrame(Frame(bmp, x, y, w, h), sent, monW.toFloat(), monH.toFloat())
+                    pad.onFrame(Frame(bmp, x, y, w, h, cursorX, cursorY), sent, monW.toFloat(), monH.toFloat())
 
                     frames++; bytes += len; rttSum += now - sent
                     if (now - since >= 1000) {
@@ -287,7 +344,7 @@ class Discovery(context: Context) {
     }
 }
 
-// Общий широковещательный адрес и адрес вашей Wi-Fi сети (на некоторых телефонах общий не доходит)
+// Общий широковещательный адрес и адрес вашей Wi-Fi сети (на некоторых устройствах общий не доходит)
 private fun broadcastAddresses(context: Context): List<InetAddress> {
     val list = mutableListOf(InetAddress.getByName("255.255.255.255"))
     runCatching {

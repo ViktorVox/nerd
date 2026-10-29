@@ -4,6 +4,25 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Redo
+import androidx.compose.material.icons.rounded.Remove
+import androidx.compose.material.icons.rounded.RotateLeft
+import androidx.compose.material.icons.rounded.RotateRight
+import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Undo
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Slider
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -81,6 +100,7 @@ class MainActivity : ComponentActivity() {
         }
         val prefs = getSharedPreferences("nerd", MODE_PRIVATE)
         val identity = Identity.load(prefs)
+        AppSettings.load(prefs)
 
         setContent {
             MaterialTheme(colorScheme = NerdColors) {
@@ -131,7 +151,7 @@ private fun ConnectScreen(last: String, auto: Boolean, onConnect: (String) -> Un
         ) {
             Text("Nerd", style = MaterialTheme.typography.displayMedium, color = MaterialTheme.colorScheme.onBackground)
             Text(
-                "Телефон как графический планшет для компьютера",
+                "Превращает устройство в графический планшет для компьютера",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -147,7 +167,7 @@ private fun ConnectScreen(last: String, auto: Boolean, onConnect: (String) -> Un
                     )
                 }
                 Text(
-                    "Запусти программу Nerd на компьютере. Телефон и компьютер должны быть в одной Wi-Fi сети.",
+                    "Запусти программу Nerd на компьютере. Устройство и компьютер должны быть в одной Wi-Fi сети.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center,
@@ -197,7 +217,7 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val sender = remember { Sender(host) }
     val pad = remember { PadView(context, sender) }
-    val client = remember { ScreenClient(host, pad, sender, identity) }
+    val client = remember { ScreenClient(context, host, pad, sender, identity) }
     DisposableEffect(Unit) { onDispose { client.stop() } }
     BackHandler(onBack = onExit)
 
@@ -208,6 +228,17 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
     var monitors by remember { mutableStateOf(emptyList<MonitorOption>()) }
     var currentMonitor by remember { mutableStateOf(0) }
     var menuOpen by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
+    var ctrl by remember { mutableStateOf(false) }
+    var shift by remember { mutableStateOf(false) }
+    var spaceDown by remember { mutableStateOf(false) }
+    // Залипшие Ctrl и Shift отпускаем при выходе, чтобы они не остались нажатыми на компьютере
+    DisposableEffect(Unit) {
+        onDispose {
+            if (ctrl) sender.key(VK_CTRL, false)
+            if (shift) sender.key(VK_SHIFT, false)
+        }
+    }
     LaunchedEffect(Unit) {
         while (true) {
             stats = client.statsText
@@ -262,7 +293,7 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
             modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 8.dp),
         ) {
             Row(
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                modifier = Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
@@ -277,6 +308,9 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
                 }
                 IconButton(onClick = { pad.fit() }) {
                     Icon(Icons.Rounded.Refresh, contentDescription = "Сбросить вид")
+                }
+                IconButton(onClick = { showSettings = true }) {
+                    Icon(Icons.Rounded.Settings, contentDescription = "Настройки")
                 }
                 if (monitors.size > 1) {
                     Box {
@@ -303,6 +337,91 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
                     Icon(Icons.Rounded.Close, contentDescription = "Отключиться")
                 }
             }
+        }
+
+        // Нижняя панель: быстрые клавиши для Krita и других программ рисования
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+            tonalElevation = 6.dp,
+            modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 8.dp, start = 8.dp, end = 8.dp),
+        ) {
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                IconButton(onClick = { sender.undo() }) { Icon(Icons.Rounded.Undo, contentDescription = "Отменить") }
+                IconButton(onClick = { sender.redo() }) { Icon(Icons.Rounded.Redo, contentDescription = "Вернуть") }
+                Spacer(Modifier.width(6.dp))
+                IconButton(onClick = { sender.combo(VK_BRACKET_LEFT) }) { Icon(Icons.Rounded.Remove, contentDescription = "Кисть меньше") }
+                IconButton(onClick = { sender.combo(VK_BRACKET_RIGHT) }) { Icon(Icons.Rounded.Add, contentDescription = "Кисть больше") }
+                TextButton(onClick = { sender.combo(VK_E) }) { Text("Ластик") }
+                Spacer(Modifier.width(6.dp))
+                IconButton(onClick = { sender.rotateCanvas(false) }) { Icon(Icons.Rounded.RotateLeft, contentDescription = "Повернуть холст влево") }
+                IconButton(onClick = { sender.rotateCanvas(true) }) { Icon(Icons.Rounded.RotateRight, contentDescription = "Повернуть холст вправо") }
+                Spacer(Modifier.width(6.dp))
+                FilterChip(
+                    selected = ctrl,
+                    onClick = { ctrl = !ctrl; sender.key(VK_CTRL, ctrl) },
+                    label = { Text("Ctrl") },
+                )
+                FilterChip(
+                    selected = shift,
+                    onClick = { shift = !shift; sender.key(VK_SHIFT, shift) },
+                    label = { Text("Shift") },
+                )
+                // Пробел работает, пока кнопка удерживается: так двигают холст в Krita
+                val chip = RoundedCornerShape(8.dp)
+                Box(
+                    modifier = Modifier
+                        .height(32.dp)
+                        .clip(chip)
+                        .background(if (spaceDown) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
+                        .border(1.dp, MaterialTheme.colorScheme.outline, chip)
+                        .padding(horizontal = 14.dp)
+                        .pointerInput(Unit) {
+                            detectTapGestures(onPress = {
+                                spaceDown = true
+                                sender.key(VK_SPACE, true)
+                                try { awaitRelease() } finally {
+                                    spaceDown = false
+                                    sender.key(VK_SPACE, false)
+                                }
+                            })
+                        },
+                    contentAlignment = Alignment.Center,
+                ) { Text("Пробел", style = MaterialTheme.typography.labelLarge) }
+            }
+        }
+
+        if (showSettings) {
+            val prefs = remember { context.getSharedPreferences("nerd", android.content.Context.MODE_PRIVATE) }
+            var quality by remember { mutableStateOf(AppSettings.quality) }
+            var pressure by remember { mutableStateOf(AppSettings.fingerPressure) }
+            AlertDialog(
+                onDismissRequest = { showSettings = false },
+                title = { Text("Настройки") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Качество картинки: $quality", style = MaterialTheme.typography.bodyMedium)
+                        Slider(
+                            value = quality.toFloat(),
+                            onValueChange = { quality = it.toInt(); AppSettings.quality = quality },
+                            valueRange = 30f..90f,
+                        )
+                        Text("Сила нажима пальцем: ${(pressure * 100).toInt()}%", style = MaterialTheme.typography.bodyMedium)
+                        Slider(
+                            value = pressure,
+                            onValueChange = { pressure = it; AppSettings.fingerPressure = it },
+                            valueRange = 0.1f..1f,
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { AppSettings.save(prefs); showSettings = false }) { Text("Готово") }
+                },
+            )
         }
     }
 }

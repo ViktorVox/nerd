@@ -4,18 +4,20 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.RectF
 import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.View
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.sin
 
-private const val FINGER_PRESSURE = 0.6f
 private const val TAP_SLOP = 24f
 private const val LONG_PRESS_MS = 500L
 
@@ -37,7 +39,7 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
 
     @Volatile private var frame: Frame? = null
 
-    // Вид: scale — пикселей экрана на пиксель монитора; (ox, oy) — точка монитора в левом верхнем углу экрана
+    // Вид: scale - пикселей экрана на пиксель монитора; (ox, oy) - точка монитора в левом верхнем углу экрана
     private var scale = 1f
     private var ox = 0f
     private var oy = 0f
@@ -50,6 +52,15 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
     private var gScale = 1f
     private var gAnchorX = 0f
     private var gAnchorY = 0f
+    private var gAngle = 0f
+    private var gAngleAcc = 0f
+
+    // Касание тремя пальцами - отмена, четырьмя - возврат
+    private var tapStart = 0L
+    private var tapMax = 0
+    private var tapMoved = false
+    private val tapX = FloatArray(10)
+    private val tapY = FloatArray(10)
 
     private var penDown = false
     private var lastX = 0f
@@ -67,6 +78,15 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
         isAntiAlias = true
     }
     private val bitmapPaint = Paint().apply { isFilterBitmap = true }
+    private val cursorFill = Paint().apply { color = Color.WHITE; isAntiAlias = true }
+    private val cursorLine = Paint().apply {
+        color = Color.rgb(20, 20, 24); style = Paint.Style.STROKE; strokeWidth = 2.5f; isAntiAlias = true
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val cursorPath = Path().apply {
+        moveTo(0f, 0f); lineTo(0f, 16f); lineTo(4f, 12.5f); lineTo(7f, 19f); lineTo(9.5f, 18f)
+        lineTo(6.5f, 11.7f); lineTo(11.5f, 11.7f); close()
+    }
 
     init {
         setBackgroundColor(Color.rgb(14, 15, 19))
@@ -92,11 +112,11 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
         b.putFloat(x0 / monW).putFloat(y0 / monH).putFloat((x1 - x0) / monW).putFloat((y1 - y0) / monH)
         b.putShort(((x1 - x0) * scale).toInt().coerceIn(16, 2560).toShort())
         b.putShort(((y1 - y0) * scale).toInt().coerceIn(16, 1440).toShort())
-        b.put(JPEG_QUALITY.toByte())
+        b.put(AppSettings.quality.toByte())
         return b.array()
     }
 
-    // sentAt — момент, когда был отправлен запрос этого кадра
+    // sentAt - момент, когда был отправлен запрос этого кадра
     fun onFrame(f: Frame, sentAt: Long, w: Float, h: Float) {
         frame = f
         pruneInk(sentAt - INK_MARGIN_MS)
@@ -131,6 +151,18 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
                 ((it.x + it.w) * monW - ox) * scale, ((it.y + it.h) * monH - oy) * scale,
             )
             c.drawBitmap(it.bmp, null, dst, bitmapPaint)
+        }
+        frame?.let {
+            // В режиме «Мышь» показываем, где сейчас курсор Windows
+            if (mode == Mode.MOUSE && it.cursorX >= 0f) {
+                val k = resources.displayMetrics.density * 1.1f
+                c.save()
+                c.translate((it.cursorX * monW - ox) * scale, (it.cursorY * monH - oy) * scale)
+                c.scale(k, k)
+                c.drawPath(cursorPath, cursorFill)
+                c.drawPath(cursorPath, cursorLine)
+                c.restore()
+            }
         }
         synchronized(ink) {
             var prev: InkPoint? = null
@@ -179,7 +211,7 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
         downTime = e.eventTime; moved = false
         when (mode) {
             Mode.DRAW -> {
-                pen(DOWN, e.x, e.y, FINGER_PRESSURE)
+                pen(DOWN, e.x, e.y, AppSettings.fingerPressure)
                 addInk(e.x, e.y, true)
                 penDown = true
             }
@@ -193,10 +225,10 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
         when (mode) {
             Mode.DRAW -> {
                 for (h in 0 until e.historySize) {
-                    pen(DRAG, e.getHistoricalX(h), e.getHistoricalY(h), FINGER_PRESSURE)
+                    pen(DRAG, e.getHistoricalX(h), e.getHistoricalY(h), AppSettings.fingerPressure)
                     addInk(e.getHistoricalX(h), e.getHistoricalY(h), false)
                 }
-                pen(DRAG, e.x, e.y, FINGER_PRESSURE)
+                pen(DRAG, e.x, e.y, AppSettings.fingerPressure)
                 addInk(e.x, e.y, false)
                 invalidate()
             }
@@ -227,6 +259,21 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
         val my = (e.getY(0) + e.getY(1)) / 2
         gAnchorX = ox + mx / scale
         gAnchorY = oy + my / scale
+        gAngle = atan2(e.getY(1) - e.getY(0), e.getX(1) - e.getX(0))
+        gAngleAcc = 0f
+    }
+
+    // Поворот двумя пальцами вращает холст в программе на ПК: шаг 15°, как у горячих клавиш Krita
+    private fun gestureRotate(e: MotionEvent) {
+        val a = atan2(e.getY(1) - e.getY(0), e.getX(1) - e.getX(0))
+        var d = a - gAngle
+        if (d > Math.PI) d -= (2 * Math.PI).toFloat()
+        if (d < -Math.PI) d += (2 * Math.PI).toFloat()
+        gAngle = a
+        gAngleAcc += d
+        val step = Math.toRadians(15.0).toFloat()
+        while (gAngleAcc >= step) { sender.rotateCanvas(true); gAngleAcc -= step }
+        while (gAngleAcc <= -step) { sender.rotateCanvas(false); gAngleAcc += step }
     }
 
     private fun gestureMove(e: MotionEvent) {
@@ -236,29 +283,59 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
         scale = (gScale * d / gDist).coerceIn(fitScale * 0.9f, fitScale * 12f)
         ox = gAnchorX - mx / scale
         oy = gAnchorY - my / scale
+        gestureRotate(e)
         invalidate()
+    }
+
+    private fun trackTap(e: MotionEvent) {
+        for (i in 0 until e.pointerCount) {
+            val id = e.getPointerId(i)
+            if (id < tapX.size && hypot(e.getX(i) - tapX[id], e.getY(i) - tapY[id]) > 48f) tapMoved = true
+        }
+    }
+
+    private fun rememberTap(e: MotionEvent, index: Int) {
+        val id = e.getPointerId(index)
+        if (id < tapX.size) { tapX[id] = e.getX(index); tapY[id] = e.getY(index) }
     }
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
         if (e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS) return stylus(e)
         when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> { gesturing = false; fingerDown(e) }
+            MotionEvent.ACTION_DOWN -> {
+                gesturing = false
+                tapStart = e.eventTime; tapMax = 1; tapMoved = false
+                rememberTap(e, 0)
+                fingerDown(e)
+            }
             MotionEvent.ACTION_POINTER_DOWN -> {
+                tapMax = maxOf(tapMax, e.pointerCount)
+                rememberTap(e, e.actionIndex)
                 if (!gesturing) {
                     fingerEnd(null, false)
                     gesturing = true
                 }
                 if (e.pointerCount == 2) gestureStart(e)
             }
-            MotionEvent.ACTION_MOVE -> when {
-                gesturing -> if (e.pointerCount >= 2) gestureMove(e)
-                else -> fingerMove(e)
+            MotionEvent.ACTION_MOVE -> {
+                trackTap(e)
+                when {
+                    gesturing -> if (e.pointerCount >= 2) gestureMove(e)
+                    else -> fingerMove(e)
+                }
             }
             MotionEvent.ACTION_POINTER_UP -> if (gesturing && e.pointerCount == 3) {
                 // Остались два пальца: пересчитать опору жеста
                 gestureStart(e)
             }
-            MotionEvent.ACTION_UP -> { if (!gesturing) fingerEnd(e, true); gesturing = false }
+            MotionEvent.ACTION_UP -> {
+                if (!gesturing) fingerEnd(e, true)
+                gesturing = false
+                if (tapMax >= 3 && !tapMoved && e.eventTime - tapStart < 400) {
+                    if (tapMax == 3) sender.undo() else sender.redo()
+                }
+                tapMax = 0
+            }
             MotionEvent.ACTION_CANCEL -> { if (!gesturing) fingerEnd(e, false); gesturing = false }
             else -> return false
         }
