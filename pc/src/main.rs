@@ -7,7 +7,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
     GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, COLORONCOLOR, DIB_RGB_COLORS, HALFTONE, HDC, HMONITOR, MONITORINFO,
+    BITMAPINFOHEADER, BI_RGB, COLORONCOLOR, DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFO,
     MONITORINFOEXW, SRCCOPY,
 };
 use windows::Win32::UI::Controls::{
@@ -98,6 +98,7 @@ fn monitors() -> Vec<(u32, RECT)> {
 struct Pen {
     device: HSYNTHETICPOINTERDEVICE,
     in_range: bool,
+    contact: bool,
     x0: i32,
     y0: i32,
     w: i32,
@@ -112,7 +113,7 @@ impl Pen {
         if let Some(r) = monitor.and_then(|n| monitors().into_iter().find(|m| m.0 == n)).map(|m| m.1) {
             (x0, y0, w, h) = (r.left, r.top, r.right - r.left, r.bottom - r.top);
         }
-        Ok(Self { device, in_range: false, x0, y0, w, h })
+        Ok(Self { device, in_range: false, contact: false, x0, y0, w, h })
     }
 
     // Доля монитора (0..1) в пиксели рабочего стола
@@ -136,7 +137,15 @@ impl Pen {
                 y - GetSystemMetrics(SM_YVIRTUALSCREEN),
             )
         };
-        let mut flags = match p.action {
+        // Windows отвергает отрыв без касания и движение с касанием без начала: исправляем последовательность
+        let action = match (p.action, self.contact) {
+            (DOWN, true) => DRAG,
+            (DRAG, false) => DOWN,
+            (UP, false) => return,
+            (a, _) => a,
+        };
+        self.contact = matches!(action, DOWN | DRAG);
+        let mut flags = match action {
             HOVER => POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE,
             DOWN => {
                 POINTER_FLAG_INRANGE
@@ -155,15 +164,15 @@ impl Pen {
             _ => return,
         };
         // Первое сообщение после входа в зону должно быть NEW
-        if p.action != LEAVE && !self.in_range {
+        if action != LEAVE && !self.in_range {
             flags |= POINTER_FLAG_NEW;
             self.in_range = true;
         }
-        if p.action == LEAVE {
+        if action == LEAVE {
             self.in_range = false;
         }
 
-        let touching = matches!(p.action, DOWN | DRAG);
+        let touching = matches!(action, DOWN | DRAG);
         let pressure = if touching {
             ((p.pressure.clamp(0.0, 1.0) * 1024.0) as u32).max(1)
         } else {
@@ -331,14 +340,15 @@ fn command(pen: &Pen, buf: &[u8]) {
 }
 
 // Снимок области монитора, уменьшенный/увеличенный до ow x oh, в JPEG
-fn capture_jpeg(sx: i32, sy: i32, sw: i32, sh: i32, ow: i32, oh: i32, quality: u8) -> Option<Vec<u8>> {
+fn capture_jpeg(sx: i32, sy: i32, sw: i32, sh: i32, ow: i32, oh: i32, quality: u8) -> Option<(Vec<u8>, Duration)> {
+    let t0 = std::time::Instant::now();
     let mut buf = vec![0u8; (ow * oh * 4) as usize];
     unsafe {
         let screen = GetDC(None);
         let mem = CreateCompatibleDC(Some(screen));
         let bmp = CreateCompatibleBitmap(screen, ow, oh);
         let old = SelectObject(mem, bmp.into());
-        SetStretchBltMode(mem, if sw > ow { HALFTONE } else { COLORONCOLOR });
+        SetStretchBltMode(mem, COLORONCOLOR);
         let ok = StretchBlt(mem, 0, 0, ow, oh, Some(screen), sx, sy, sw, sh, SRCCOPY).as_bool();
         let mut bmi = BITMAPINFO::default();
         bmi.bmiHeader = BITMAPINFOHEADER {
@@ -359,11 +369,12 @@ fn capture_jpeg(sx: i32, sy: i32, sw: i32, sh: i32, ow: i32, oh: i32, quality: u
             return None;
         }
     }
+    let captured = t0.elapsed();
     let mut out = Vec::with_capacity(64 * 1024);
     jpeg_encoder::Encoder::new(&mut out, quality)
         .encode(&buf, ow as u16, oh as u16, jpeg_encoder::ColorType::Bgra)
         .ok()?;
-    Some(out)
+    Some((out, captured))
 }
 
 // Запрос (24 байта): x f32, y f32, w f32, h f32 (доли монитора) | out_w u16, out_h u16 | quality u8 | 3 байта
@@ -372,6 +383,9 @@ fn serve_client(mut s: TcpStream, mon: (i32, i32, i32, i32)) -> std::io::Result<
     s.set_nodelay(true)?;
     let (x0, y0, w, h) = mon;
     let mut req = [0u8; 24];
+    let (mut frames, mut spent, mut bytes) = (0u32, Duration::ZERO, 0usize);
+    let mut cap_spent = Duration::ZERO;
+    let mut since = std::time::Instant::now();
     loop {
         s.read_exact(&mut req)?;
         let f = |i: usize| f32::from_le_bytes(req[i..i + 4].try_into().unwrap());
@@ -384,10 +398,25 @@ fn serve_client(mut s: TcpStream, mon: (i32, i32, i32, i32)) -> std::io::Result<
         let sy = y0 + (ry * h as f32) as i32;
         let sw = ((rw * w as f32) as i32).max(1);
         let sh = ((rh * h as f32) as i32).max(1);
-        let Some(jpeg) = capture_jpeg(sx, sy, sw, sh, ow, oh, quality) else {
+        let t0 = std::time::Instant::now();
+        let Some((jpeg, cap)) = capture_jpeg(sx, sy, sw, sh, ow, oh, quality) else {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         };
+        frames += 1;
+        spent += t0.elapsed();
+        cap_spent += cap;
+        bytes += jpeg.len();
+        if since.elapsed() >= Duration::from_secs(3) {
+            println!(
+                "кадров {frames} ({:.0}/с), съёмка {:.1} мс + JPEG {:.1} мс, {} КБ/кадр",
+                frames as f32 / since.elapsed().as_secs_f32(),
+                cap_spent.as_secs_f32() * 1000.0 / frames as f32,
+                (spent - cap_spent).as_secs_f32() * 1000.0 / frames as f32,
+                bytes / frames as usize / 1024
+            );
+            (frames, spent, bytes, since, cap_spent) = (0, Duration::ZERO, 0, std::time::Instant::now(), Duration::ZERO);
+        }
         let mut head = Vec::with_capacity(28);
         for v in [rx, ry, rw, rh] {
             head.extend_from_slice(&v.to_le_bytes());
