@@ -10,6 +10,11 @@ use windows::Win32::UI::Controls::{
     CreateSyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
     POINTER_FEEDBACK_DEFAULT, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, MOUSE_EVENT_FLAGS,
+};
 use windows::Win32::UI::Input::Pointer::{
     POINTER_FLAG_DOWN, POINTER_FLAG_FIRSTBUTTON, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE,
     POINTER_FLAG_NEW, POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO,
@@ -27,6 +32,7 @@ use windows::core::BOOL;
 
 const PORT: u16 = 47800;
 const MAGIC: u8 = 0x4E;
+const CMD_MAGIC: u8 = 0x4F;
 const PACKET_LEN: usize = 20;
 
 // Действия из пакета
@@ -104,9 +110,16 @@ impl Pen {
         Ok(Self { device, in_range: false, x0, y0, w, h })
     }
 
+    // Доля монитора (0..1) в пиксели рабочего стола
+    fn pixel(&self, x: f32, y: f32) -> (i32, i32) {
+        (
+            self.x0 + (x.clamp(0.0, 1.0) * (self.w - 1) as f32) as i32,
+            self.y0 + (y.clamp(0.0, 1.0) * (self.h - 1) as f32) as i32,
+        )
+    }
+
     fn inject(&mut self, p: &Packet) {
-        let x = self.x0 + (p.x.clamp(0.0, 1.0) * (self.w - 1) as f32) as i32;
-        let y = self.y0 + (p.y.clamp(0.0, 1.0) * (self.h - 1) as f32) as i32;
+        let (x, y) = self.pixel(p.x, p.y);
         self.inject_px(p, x, y);
     }
 
@@ -266,6 +279,52 @@ fn probe(pen: &mut Pen) {
     }
 }
 
+fn send_mouse(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS) {
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT { dx, dy, mouseData: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+        },
+    };
+    unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+}
+
+fn mouse_move(px: i32, py: i32) {
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    let dx = ((px - vx) as i64 * 65535 / (vw - 1).max(1) as i64) as i32;
+    let dy = ((py - vy) as i64 * 65535 / (vh - 1).max(1) as i64) as i32;
+    send_mouse(dx, dy, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK);
+}
+
+// Формат команд: CMD_MAGIC | kind u8 | ... ; kind 0: x f32, y f32 (курсор); kind 1: кнопка u8 (0 левая, 1 правая), down u8
+fn command(pen: &Pen, buf: &[u8]) {
+    let f = |i: usize| f32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
+    match buf.get(1) {
+        Some(0) if buf.len() >= 12 => {
+            let (x, y) = pen.pixel(f(4), f(8));
+            mouse_move(x, y);
+        }
+        Some(1) if buf.len() >= 4 => {
+            let flag = match (buf[2], buf[3] != 0) {
+                (0, true) => MOUSEEVENTF_LEFTDOWN,
+                (0, false) => MOUSEEVENTF_LEFTUP,
+                (1, true) => MOUSEEVENTF_RIGHTDOWN,
+                (1, false) => MOUSEEVENTF_RIGHTUP,
+                _ => return,
+            };
+            send_mouse(0, 0, flag);
+        }
+        _ => {}
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let monitor = args.iter().position(|a| a == "--monitor").and_then(|i| args.get(i + 1)?.parse().ok());
@@ -299,7 +358,9 @@ fn main() {
     loop {
         match sock.recv_from(&mut buf) {
             Ok((n, _)) => {
-                if let Some(p) = parse(&buf[..n]) {
+                if n > 0 && buf[0] == CMD_MAGIC {
+                    command(&pen, &buf[..n]);
+                } else if let Some(p) = parse(&buf[..n]) {
                     pen.inject(&p);
                 }
             }
