@@ -177,24 +177,30 @@ impl Pen {
 }
 
 // Проверка без телефона: перо рисует круг в центре экрана
-fn demo(pen: &mut Pen) {
-    let pk = |action, x: f32, y: f32, pressure| Packet { action, x, y, pressure, tilt_x: 0, tilt_y: 0 };
-    let pt = |t: f32| (0.5 + 0.15 * t.cos(), 0.5 + 0.2 * t.sin());
+fn demo(pen: &mut Pen, at: Option<(i32, i32, i32)>) {
+    let pk = |action, pressure| Packet { action, x: 0.0, y: 0.0, pressure, tilt_x: 0, tilt_y: 0 };
+    let (cx, cy, rx, ry) = at.map(|(x, y, r)| (x, y, r, r)).unwrap_or((
+        pen.x0 + pen.w / 2,
+        pen.y0 + pen.h / 2,
+        (0.15 * pen.w as f32) as i32,
+        (0.2 * pen.h as f32) as i32,
+    ));
+    let pt = |t: f32| ((cx as f32 + rx as f32 * t.cos()) as i32, (cy as f32 + ry as f32 * t.sin()) as i32);
     let step = Duration::from_millis(8);
     let (x, y) = pt(0.0);
-    pen.inject(&pk(HOVER, x, y, 0.0));
+    pen.inject_px(&pk(HOVER, 0.0), x, y);
     std::thread::sleep(Duration::from_millis(300));
-    pen.inject(&pk(DOWN, x, y, 0.5));
+    pen.inject_px(&pk(DOWN, 0.5), x, y);
     for i in 1..=300 {
         let t = i as f32 / 300.0 * std::f32::consts::TAU;
         let (x, y) = pt(t);
         // давление плавно растёт и падает
-        pen.inject(&pk(DRAG, x, y, 0.1 + 0.9 * (t / 2.0).sin().abs()));
+        pen.inject_px(&pk(DRAG, 0.1 + 0.9 * (t / 2.0).sin().abs()), x, y);
         std::thread::sleep(step);
     }
     let (x, y) = pt(std::f32::consts::TAU);
-    pen.inject(&pk(UP, x, y, 0.0));
-    pen.inject(&pk(LEAVE, x, y, 0.0));
+    pen.inject_px(&pk(UP, 0.0), x, y);
+    pen.inject_px(&pk(LEAVE, 0.0), x, y);
 }
 
 unsafe extern "system" fn probe_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -279,7 +285,11 @@ fn main() {
     if args.iter().any(|a| a == "--demo") {
         println!("демо: через 3 секунды перо нарисует круг. Открой Paint или Krita.");
         std::thread::sleep(Duration::from_secs(3));
-        demo(&mut pen);
+        let at = args.iter().position(|a| a == "--at").and_then(|i| {
+            let v: Vec<i32> = args.get(i + 1)?.split(',').filter_map(|n| n.parse().ok()).collect();
+            (v.len() == 3).then(|| (v[0], v[1], v[2]))
+        });
+        demo(&mut pen, at);
         return;
     }
 
