@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Буква N, нарисованная одним штрихом пера -->
+    <path
+        android:pathData="M37,76 L37,34 L71,74 L71,32"
+        android:strokeWidth="9"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeColor="#FF8FA8FF" />
+    <!-- Кончик пера -->
+    <path
+        android:pathData="M71,26 m-4,0 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0"
+        android:fillColor="#FFFFFFFF" />
+</vector>

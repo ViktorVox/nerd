@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -21,6 +22,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -32,6 +35,7 @@ import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -44,6 +48,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
@@ -78,14 +83,16 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(colorScheme = NerdColors) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     var host by remember { mutableStateOf<String?>(null) }
+                    // Сразу подключаемся к последнему компьютеру, но не после того, как пользователь сам отключился
+                    var auto by remember { mutableStateOf(true) }
                     val current = host
                     if (current == null) {
-                        ConnectScreen(initial = prefs.getString("ip", "") ?: "") {
+                        ConnectScreen(last = prefs.getString("ip", "") ?: "", auto = auto) {
                             prefs.edit().putString("ip", it).apply()
                             host = it
                         }
                     } else {
-                        PadScreen(current) { host = null }
+                        PadScreen(current) { auto = false; host = null }
                     }
                 }
             }
@@ -93,12 +100,29 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ConnectScreen(initial: String, onConnect: (String) -> Unit) {
-    var ip by remember { mutableStateOf(initial) }
+private fun ConnectScreen(last: String, auto: Boolean, onConnect: (String) -> Unit) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val discovery = remember { Discovery(context) }
+    DisposableEffect(Unit) { onDispose { discovery.stop() } }
+
+    var found by remember { mutableStateOf(emptyList<FoundPc>()) }
+    var manual by remember { mutableStateOf(false) }
+    var ip by remember { mutableStateOf(last) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            found = discovery.found
+            delay(500)
+        }
+    }
+    LaunchedEffect(found) {
+        if (auto && last.isNotEmpty() && found.any { it.ip == last }) onConnect(last)
+    }
+
     Box(modifier = Modifier.fillMaxSize().statusBarsPadding(), contentAlignment = Alignment.Center) {
         Column(
-            modifier = Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(24.dp),
+            modifier = Modifier.widthIn(max = 460.dp).fillMaxWidth().padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -108,22 +132,58 @@ private fun ConnectScreen(initial: String, onConnect: (String) -> Unit) {
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Spacer(Modifier.height(16.dp))
-            OutlinedTextField(
-                value = ip,
-                onValueChange = { ip = it },
-                label = { Text("IP компьютера") },
-                placeholder = { Text("192.168.1.10") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                shape = RoundedCornerShape(16.dp),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Button(
-                onClick = { if (ip.isNotBlank()) onConnect(ip.trim()) },
-                shape = RoundedCornerShape(16.dp),
-                modifier = Modifier.fillMaxWidth().height(52.dp),
-            ) { Text("Подключиться") }
+            Spacer(Modifier.height(12.dp))
+
+            if (found.isEmpty()) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Text(
+                        "Ищу компьютеры в сети…",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Text(
+                    "Запусти программу Nerd на компьютере. Телефон и компьютер должны быть в одной Wi-Fi сети.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
+            found.forEach { pc ->
+                Card(
+                    onClick = { onConnect(pc.ip) },
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp)) {
+                        Text(pc.name, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
+                        Text(pc.ip, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+
+            TextButton(onClick = { manual = !manual }) {
+                Text(if (manual) "Скрыть ввод адреса" else "Ввести адрес вручную")
+            }
+            if (manual) {
+                OutlinedTextField(
+                    value = ip,
+                    onValueChange = { ip = it },
+                    label = { Text("IP компьютера") },
+                    placeholder = { Text("192.168.1.10") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Button(
+                    onClick = { if (ip.isNotBlank()) onConnect(ip.trim()) },
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                ) { Text("Подключиться") }
+            }
         }
     }
 }

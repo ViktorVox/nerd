@@ -38,6 +38,7 @@ use windows::core::BOOL;
 
 const PORT: u16 = 47800;
 const SCREEN_PORT: u16 = 47801;
+const DISCOVERY_PORT: u16 = 47802;
 const MAGIC: u8 = 0x4E;
 const CMD_MAGIC: u8 = 0x4F;
 const PACKET_LEN: usize = 20;
@@ -455,6 +456,22 @@ fn serve_screen(mon: (i32, i32, i32, i32)) {
     }
 }
 
+// Телефон рассылает «NERD?» по локальной сети, ПК отвечает «NERD!» и своим именем
+fn serve_discovery() {
+    let Ok(sock) = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) else {
+        eprintln!("порт поиска {DISCOVERY_PORT} занят: телефон не найдёт ПК сам");
+        return;
+    };
+    let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "ПК".into());
+    let reply = format!("NERD!{name}");
+    let mut buf = [0u8; 16];
+    while let Ok((n, from)) = sock.recv_from(&mut buf) {
+        if &buf[..n] == b"NERD?" {
+            let _ = sock.send_to(reply.as_bytes(), from);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let monitor = args.iter().position(|a| a == "--monitor").and_then(|i| args.get(i + 1)?.parse().ok());
@@ -484,6 +501,7 @@ fn main() {
 
     let mon = (pen.x0, pen.y0, pen.w, pen.h);
     std::thread::spawn(move || serve_screen(mon));
+    std::thread::spawn(serve_discovery);
     let sock = UdpSocket::bind(("0.0.0.0", PORT)).expect("порт занят");
     println!("Слушаю UDP :{PORT}, экран по TCP :{SCREEN_PORT}. Монитор {}x{}", pen.w, pen.h);
     let mut buf = [0u8; 64];
