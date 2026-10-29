@@ -1,9 +1,11 @@
 #![windows_subsystem = "windows"]
 
+mod auth;
 mod capture;
 mod devtools;
 mod dxgi;
 mod log;
+mod menu;
 mod monitors;
 mod net;
 mod pen;

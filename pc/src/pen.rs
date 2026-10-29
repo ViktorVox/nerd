@@ -40,7 +40,7 @@ pub struct Packet {
 }
 
 // Формат (20 байт, little-endian):
-// magic u8 | action u8 | buttons u8 | pad u8 | x f32 | y f32 | pressure f32 | tilt_x i16 | tilt_y i16
+// magic u8 | action u8 | код сессии u16 | x f32 | y f32 | pressure f32 | tilt_x i16 | tilt_y i16
 pub fn parse(buf: &[u8]) -> Option<Packet> {
     if buf.len() < PACKET_LEN || buf[0] != MAGIC {
         return None;
@@ -181,7 +181,8 @@ fn mouse_move(px: i32, py: i32) {
     send_mouse(dx, dy, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK);
 }
 
-// Формат команд: CMD_MAGIC | kind u8 | ... ; kind 0: x f32, y f32 (курсор); kind 1: кнопка u8 (0 левая, 1 правая), down u8
+// Формат команд: CMD_MAGIC | kind u8 | код сессии u16 | ...
+// kind 0: x f32, y f32 (курсор); kind 1: кнопка u8 (0 левая, 1 правая), down u8
 pub fn command(buf: &[u8]) {
     let f = |i: usize| f32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
     match buf.get(1) {
@@ -189,8 +190,8 @@ pub fn command(buf: &[u8]) {
             let (x, y) = pixel(f(4), f(8));
             mouse_move(x, y);
         }
-        Some(1) if buf.len() >= 4 => {
-            let flag = match (buf[2], buf[3] != 0) {
+        Some(1) if buf.len() >= 6 => {
+            let flag = match (buf[4], buf[5] != 0) {
                 (0, true) => MOUSEEVENTF_LEFTDOWN,
                 (0, false) => MOUSEEVENTF_LEFTUP,
                 (1, true) => MOUSEEVENTF_RIGHTDOWN,

@@ -1,10 +1,10 @@
-// Значок в трее: статус, выбор монитора, запуск вместе с Windows, выход
-use crate::monitors;
-use crate::settings;
+// Значок в трее: подпись со статусом, уведомления, открытие меню (menu.rs)
+use crate::menu::Action;
+use crate::{auth, menu, monitors, settings};
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Mutex;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::{
@@ -12,27 +12,24 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetCursorPos,
-    GetMessageW, GetSystemMetrics, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu, TranslateMessage, HICON, IMAGE_ICON,
-    LR_DEFAULTCOLOR, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_LBUTTONUP, WM_NULL,
-    WM_RBUTTONUP, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics, LoadImageW, PostMessageW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, TranslateMessage, HICON, IMAGE_ICON,
+    LR_DEFAULTCOLOR, MSG, SM_CXSMICON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP,
+    WNDCLASSW,
 };
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_STATUS: u32 = WM_APP + 2;
-const ID_AUTOSTART: usize = 900;
-const ID_EXIT: usize = 902;
-const ID_MONITOR: usize = 1000; // + номер монитора
+
+struct Status {
+    connected: bool,
+    text: String,
+    balloon: Option<String>,
+}
 
 static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
-static STATUS: Mutex<(String, Option<String>)> = Mutex::new((String::new(), None));
+static STATUS: Mutex<Status> = Mutex::new(Status { connected: false, text: String::new(), balloon: None });
 static TASKBAR_CREATED: Mutex<u32> = Mutex::new(0);
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
 
 // Вторую копию программы не запускаем
 pub fn single_instance() -> bool {
@@ -44,14 +41,19 @@ pub fn single_instance() -> bool {
 }
 
 // Меняет подпись значка; balloon — всплывающее уведомление
-pub fn set_status(text: &str, balloon: Option<String>) {
-    *STATUS.lock().unwrap() = (text.to_string(), balloon);
+pub fn set_status(connected: bool, text: &str, balloon: Option<String>) {
+    *STATUS.lock().unwrap() = Status { connected, text: text.to_string(), balloon };
     let h = HWND_RAW.load(Ordering::SeqCst);
     if h != 0 {
         unsafe {
             let _ = PostMessageW(Some(HWND(h as *mut _)), WM_STATUS, WPARAM(0), LPARAM(0));
         }
     }
+}
+
+fn status_text() -> String {
+    let s = STATUS.lock().unwrap();
+    if s.text.is_empty() { "Ждёт телефон".into() } else { s.text.clone() }
 }
 
 fn copy(dst: &mut [u16], s: &str) {
@@ -69,7 +71,6 @@ unsafe fn icon() -> HICON {
 }
 
 unsafe fn notify(hwnd: HWND, op: windows::Win32::UI::Shell::NOTIFY_ICON_MESSAGE, balloon: Option<&str>) {
-    let (status, _) = STATUS.lock().unwrap().clone();
     let mut d = NOTIFYICONDATAW::default();
     d.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
     d.hWnd = hwnd;
@@ -77,7 +78,7 @@ unsafe fn notify(hwnd: HWND, op: windows::Win32::UI::Shell::NOTIFY_ICON_MESSAGE,
     d.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     d.uCallbackMessage = WM_TRAY;
     d.hIcon = icon();
-    copy(&mut d.szTip, &format!("Nerd — {}", if status.is_empty() { "ждёт телефон" } else { &status }));
+    copy(&mut d.szTip, &format!("Nerd — {}", status_text()));
     if let Some(text) = balloon {
         d.uFlags |= NIF_INFO;
         copy(&mut d.szInfoTitle, "Nerd");
@@ -87,58 +88,26 @@ unsafe fn notify(hwnd: HWND, op: windows::Win32::UI::Shell::NOTIFY_ICON_MESSAGE,
     let _ = Shell_NotifyIconW(op, &d);
 }
 
-unsafe fn show_menu(hwnd: HWND) {
-    let menu = CreatePopupMenu().unwrap();
-    let (status, _) = STATUS.lock().unwrap().clone();
-    let title = format!("Nerd — {}", if status.is_empty() { "ждёт телефон" } else { &status });
-    let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(wide(&title).as_ptr()));
-    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-
-    let sub = CreatePopupMenu().unwrap();
-    let selected = monitors::selected();
-    for m in monitors::list() {
-        let label = format!(
-            "Монитор {} — {}×{}{}",
-            m.num,
-            m.rect.2,
-            m.rect.3,
-            if m.primary { " (основной в Windows)" } else { "" }
-        );
-        let mut flags = MF_STRING;
-        if selected == Some(m.num) {
-            flags |= MF_CHECKED;
-        }
-        let _ = AppendMenuW(sub, flags, ID_MONITOR + m.num as usize, PCWSTR(wide(&label).as_ptr()));
-    }
-    let _ = AppendMenuW(menu, MF_POPUP | MF_STRING, sub.0 as usize, w!("Монитор для телефона"));
-
-    let mut auto = MF_STRING;
-    if settings::autostart() {
-        auto |= MF_CHECKED;
-    }
-    let _ = AppendMenuW(menu, auto, ID_AUTOSTART, w!("Запускать вместе с Windows"));
-    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Выход"));
-
-    let mut pt = POINT::default();
-    let _ = GetCursorPos(&mut pt);
-    let _ = SetForegroundWindow(hwnd);
-    let cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, Some(0), hwnd, None).0 as usize;
-    let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-    let _ = DestroyMenu(menu);
-
-    match cmd {
-        0 => {}
-        ID_AUTOSTART => settings::set_autostart(!settings::autostart()),
-        ID_EXIT => {
-            notify(hwnd, NIM_DELETE, None);
-            std::process::exit(0);
-        }
-        c if c > ID_MONITOR => {
-            monitors::select(Some((c - ID_MONITOR) as u32));
+// Что сделать после выбора пункта меню
+pub fn run_action(action: Action) {
+    match action {
+        Action::None => {}
+        Action::SelectMonitor(n) => {
+            monitors::select(Some(n));
             settings::save(&settings::Settings { monitor: monitors::selected() });
         }
-        _ => {}
+        Action::ToggleAutostart => settings::set_autostart(!settings::autostart()),
+        Action::ForgetPhones => {
+            auth::forget_all();
+            set_status(false, "Ждёт телефон", Some("Все телефоны забыты: при подключении снова спросим разрешение".into()));
+        }
+        Action::Exit => {
+            let h = HWND_RAW.load(Ordering::SeqCst);
+            if h != 0 {
+                unsafe { notify(HWND(h as *mut _), NIM_DELETE, None) };
+            }
+            std::process::exit(0);
+        }
     }
 }
 
@@ -147,12 +116,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         WM_TRAY => {
             let event = (lp.0 & 0xFFFF) as u32;
             if event == WM_RBUTTONUP || event == WM_LBUTTONUP {
-                show_menu(hwnd);
+                let connected = STATUS.lock().unwrap().connected;
+                menu::show(connected, &status_text());
             }
             LRESULT(0)
         }
         WM_STATUS => {
-            let (_, balloon) = STATUS.lock().unwrap().clone();
+            let balloon = STATUS.lock().unwrap().balloon.take();
             notify(hwnd, NIM_MODIFY, balloon.as_deref());
             LRESULT(0)
         }

@@ -37,6 +37,8 @@ internal const val LEAVE: Byte = 4
 private const val IN_FLIGHT = 2
 
 class Sender(host: String) {
+    // Код сессии выдаёт ПК после подтверждения; пакеты без него ПК игнорирует
+    @Volatile var tag = 0
     private val queue = LinkedBlockingQueue<ByteArray>()
     private val socket = DatagramSocket()
     private val address = InetAddress.getByName(host)
@@ -50,38 +52,71 @@ class Sender(host: String) {
         }.apply { isDaemon = true }.start()
     }
 
-    // magic u8 | action u8 | buttons u8 | pad u8 | x f32 | y f32 | pressure f32 | tilt_x i16 | tilt_y i16
+    // magic u8 | action u8 | код сессии u16 | x f32 | y f32 | pressure f32 | tilt_x i16 | tilt_y i16
     fun pen(action: Byte, x: Float, y: Float, pressure: Float, tiltX: Int, tiltY: Int) {
         val b = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN)
-        b.put(MAGIC).put(action).put(0).put(0)
+        b.put(MAGIC).put(action).putShort(tag.toShort())
         b.putFloat(x).putFloat(y).putFloat(pressure)
         b.putShort(tiltX.toShort()).putShort(tiltY.toShort())
         queue.offer(b.array())
     }
 
-    // CMD_MAGIC | kind u8 | pad | pad | x f32 | y f32 (kind 0: курсор)
+    // CMD_MAGIC | kind u8 | код сессии u16 | x f32 | y f32 (kind 0: курсор)
     fun mouseMove(x: Float, y: Float) {
         val b = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
-        b.put(CMD_MAGIC).put(0).put(0).put(0).putFloat(x).putFloat(y)
+        b.put(CMD_MAGIC).put(0).putShort(tag.toShort()).putFloat(x).putFloat(y)
         queue.offer(b.array())
     }
 
-    // CMD_MAGIC | kind u8 (1: кнопка) | кнопка u8 (0 левая, 1 правая) | down u8
+    // CMD_MAGIC | kind u8 (1: кнопка) | код сессии u16 | кнопка u8 (0 левая, 1 правая) | down u8
     fun mouseButton(button: Int, down: Boolean) {
-        queue.offer(byteArrayOf(CMD_MAGIC, 1, button.toByte(), if (down) 1 else 0))
+        queue.offer(byteArrayOf(CMD_MAGIC, 1, tag.toByte(), (tag shr 8).toByte(), button.toByte(), if (down) 1 else 0))
     }
 }
 
 // Кадр экрана ПК и область монитора (доли 0..1), которую он показывает
 class Frame(val bmp: Bitmap, val x: Float, val y: Float, val w: Float, val h: Float)
 
-class ScreenClient(private val host: String, private val pad: PadView) {
+// Постоянные номер и ключ этого телефона: по ним ПК узнаёт, что телефон уже разрешён
+class Identity(val id: ByteArray, val token: ByteArray, val name: String) {
+    companion object {
+        fun load(prefs: android.content.SharedPreferences): Identity {
+            fun hex(b: ByteArray) = b.joinToString("") { "%02x".format(it) }
+            fun unhex(s: String) = ByteArray(s.length / 2) { s.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+            var id = prefs.getString("device_id", null)
+            var token = prefs.getString("device_token", null)
+            if (id == null || token == null) {
+                val rnd = java.security.SecureRandom()
+                id = hex(ByteArray(16).also { rnd.nextBytes(it) })
+                token = hex(ByteArray(16).also { rnd.nextBytes(it) })
+                prefs.edit().putString("device_id", id).putString("device_token", token).apply()
+            }
+            return Identity(unhex(id), unhex(token), "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+        }
+    }
+}
+
+enum class ConnState { CONNECTING, WAITING, CONNECTED, DENIED }
+
+class MonitorOption(val num: Int, val w: Int, val h: Int)
+
+class ScreenClient(
+    private val host: String,
+    private val pad: PadView,
+    private val sender: Sender,
+    private val identity: Identity,
+) {
     @Volatile private var running = true
     @Volatile private var socket: Socket? = null
-    @Volatile var connected = false
+    @Volatile var state = ConnState.CONNECTING
         private set
     @Volatile var statsText = ""
         private set
+    @Volatile var monitors: List<MonitorOption> = emptyList()
+        private set
+    @Volatile var currentMonitor = 0
+        private set
+    @Volatile private var wantMonitor = -1
 
     init {
         Thread { loop() }.apply { isDaemon = true; start() }
@@ -92,31 +127,76 @@ class ScreenClient(private val host: String, private val pad: PadView) {
         socket?.close()
     }
 
+    // Выбор монитора на ПК; отправляется перед следующим запросом кадра
+    fun selectMonitor(num: Int) {
+        currentMonitor = num
+        wantMonitor = num
+    }
+
+    // "NERD" | версия 2 | id 16 байт | ключ 16 байт | длина имени | имя
+    private fun hello(): ByteArray {
+        val name = identity.name.toByteArray().take(40).toByteArray()
+        return "NERD".toByteArray() + byteArrayOf(2) + identity.id + identity.token + byteArrayOf(name.size.toByte()) + name
+    }
+
     private fun loop() {
         while (running) {
             val s = Socket()
             var writer: Thread? = null
             try {
                 socket = s
+                state = ConnState.CONNECTING
                 s.tcpNoDelay = true
                 s.connect(InetSocketAddress(host, SCREEN_PORT), 3000)
                 val input = DataInputStream(s.getInputStream().buffered(1 shl 16))
                 val out = s.getOutputStream()
+                out.write(hello())
+                out.flush()
+
+                // Пока человек на компьютере нажимает «Разрешить», ждём ответ (до минуты)
+                state = ConnState.WAITING
+                s.soTimeout = 70_000
+                if (input.readUnsignedByte() == 0) {
+                    state = ConnState.DENIED
+                    running = false
+                    break
+                }
+                val b0 = ByteArray(4)
+                input.readFully(b0)
+                val bb = ByteBuffer.wrap(b0).order(ByteOrder.LITTLE_ENDIAN)
+                sender.tag = bb.short.toInt() and 0xFFFF
+                currentMonitor = bb.get().toInt() and 0xFF
+                val count = bb.get().toInt() and 0xFF
+                val list = ArrayList<MonitorOption>()
+                repeat(count) {
+                    val m = ByteArray(5)
+                    input.readFully(m)
+                    val mb = ByteBuffer.wrap(m).order(ByteOrder.LITTLE_ENDIAN)
+                    list.add(MonitorOption(mb.get().toInt() and 0xFF, mb.short.toInt() and 0xFFFF, mb.short.toInt() and 0xFFFF))
+                }
+                monitors = list
+                s.soTimeout = 0
+
                 val sentAt = ConcurrentLinkedQueue<Long>()
                 val slots = Semaphore(IN_FLIGHT)
                 writer = Thread {
                     try {
                         while (running) {
                             slots.acquire()
+                            val m = wantMonitor
+                            if (m >= 0) {
+                                wantMonitor = -1
+                                out.write(byteArrayOf(1, m.toByte()))
+                            }
                             sentAt.add(SystemClock.uptimeMillis())
-                            out.write(pad.screenRequest())
+                            out.write(byteArrayOf(0) + pad.screenRequest())
                             out.flush()
                         }
                     } catch (e: Exception) {
                         // связь закрыта или поток прерван
                     }
                 }.apply { isDaemon = true; start() }
-                connected = true
+                state = ConnState.CONNECTED
 
                 val head = ByteArray(24)
                 var frames = 0
@@ -148,8 +228,9 @@ class ScreenClient(private val host: String, private val pad: PadView) {
             } catch (e: Exception) {
                 // нет связи: пробуем снова
             } finally {
-                connected = false
+                if (state != ConnState.DENIED) state = ConnState.CONNECTING
                 statsText = ""
+                sender.tag = 0
                 writer?.interrupt()
                 runCatching { s.close() }
             }

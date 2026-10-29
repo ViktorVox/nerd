@@ -70,6 +70,8 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
 
     init {
         setBackgroundColor(Color.rgb(14, 15, 19))
+        // Пока рисуем, экран не гаснет
+        keepScreenOn = true
     }
 
     fun fit() {

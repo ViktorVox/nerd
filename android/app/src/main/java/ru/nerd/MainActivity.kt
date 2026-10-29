@@ -25,6 +25,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -78,6 +80,7 @@ class MainActivity : ComponentActivity() {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
         val prefs = getSharedPreferences("nerd", MODE_PRIVATE)
+        val identity = Identity.load(prefs)
 
         setContent {
             MaterialTheme(colorScheme = NerdColors) {
@@ -92,7 +95,7 @@ class MainActivity : ComponentActivity() {
                             host = it
                         }
                     } else {
-                        PadScreen(current) { auto = false; host = null }
+                        PadScreen(current, identity) { auto = false; host = null }
                     }
                 }
             }
@@ -190,22 +193,28 @@ private fun ConnectScreen(last: String, auto: Boolean, onConnect: (String) -> Un
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun PadScreen(host: String, onExit: () -> Unit) {
+private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val pad = remember { PadView(context, Sender(host)) }
-    val client = remember { ScreenClient(host, pad) }
+    val sender = remember { Sender(host) }
+    val pad = remember { PadView(context, sender) }
+    val client = remember { ScreenClient(host, pad, sender, identity) }
     DisposableEffect(Unit) { onDispose { client.stop() } }
     BackHandler(onBack = onExit)
 
     var mode by remember { mutableStateOf(pad.mode) }
     var stats by remember { mutableStateOf("") }
-    var connected by remember { mutableStateOf(false) }
+    var state by remember { mutableStateOf(ConnState.CONNECTING) }
     var zoom by remember { mutableStateOf(1f) }
+    var monitors by remember { mutableStateOf(emptyList<MonitorOption>()) }
+    var currentMonitor by remember { mutableStateOf(0) }
+    var menuOpen by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         while (true) {
             stats = client.statsText
-            connected = client.connected
+            state = client.state
             zoom = pad.zoom
+            monitors = client.monitors
+            currentMonitor = client.currentMonitor
             delay(400)
         }
     }
@@ -213,14 +222,36 @@ private fun PadScreen(host: String, onExit: () -> Unit) {
     Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(factory = { pad }, modifier = Modifier.fillMaxSize())
 
-        if (!connected) {
+        if (state != ConnState.CONNECTED) {
             Column(
-                modifier = Modifier.align(Alignment.Center),
+                modifier = Modifier.align(Alignment.Center).padding(24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-                Text("Подключение к $host…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                when (state) {
+                    ConnState.DENIED -> {
+                        Text("Компьютер отклонил подключение", color = MaterialTheme.colorScheme.onBackground, style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "Попробуй снова и нажми «Разрешить» в окне на компьютере.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                        )
+                        Button(onClick = onExit, shape = RoundedCornerShape(16.dp)) { Text("Назад") }
+                    }
+                    ConnState.WAITING -> {
+                        CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                        Text("Подтвердите подключение на компьютере", color = MaterialTheme.colorScheme.onBackground, style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "На экране компьютера появилось окно «Разрешить / Отклонить».",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                    else -> {
+                        CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                        Text("Подключение к $host…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
             }
         }
 
@@ -247,7 +278,20 @@ private fun PadScreen(host: String, onExit: () -> Unit) {
                 IconButton(onClick = { pad.fit() }) {
                     Icon(Icons.Rounded.Refresh, contentDescription = "Сбросить вид")
                 }
-                if (connected) {
+                if (monitors.size > 1) {
+                    Box {
+                        TextButton(onClick = { menuOpen = true }) { Text("Монитор $currentMonitor ▾") }
+                        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                            monitors.forEach { m ->
+                                DropdownMenuItem(
+                                    text = { Text("Монитор ${m.num} · ${m.w}×${m.h}") },
+                                    onClick = { menuOpen = false; client.selectMonitor(m.num) },
+                                )
+                            }
+                        }
+                    }
+                }
+                if (state == ConnState.CONNECTED) {
                     Text(
                         "×%.1f".format(zoom) + if (stats.isNotEmpty()) " · $stats" else "",
                         style = MaterialTheme.typography.labelMedium,
