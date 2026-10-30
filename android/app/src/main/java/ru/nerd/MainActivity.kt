@@ -222,6 +222,8 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
     BackHandler(onBack = onExit)
 
     var mode by remember { mutableStateOf(pad.mode) }
+    val prefsQuick = remember { context.getSharedPreferences("nerd", android.content.Context.MODE_PRIVATE) }
+    var fingerPressure by remember { mutableStateOf(AppSettings.fingerPressure) }
     var stats by remember { mutableStateOf("") }
     var state by remember { mutableStateOf(ConnState.CONNECTING) }
     var zoom by remember { mutableStateOf(1f) }
@@ -305,6 +307,14 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
                             shape = SegmentedButtonDefaults.itemShape(index, Mode.entries.size),
                         ) { Text(m.title) }
                     }
+                }
+                if (mode == Mode.DRAW) {
+                    TextButton(onClick = {
+                        val next = Math.round(fingerPressure * 5) % 5 + 1
+                        fingerPressure = next / 5f
+                        AppSettings.fingerPressure = fingerPressure
+                        AppSettings.save(prefsQuick)
+                    }) { Text("Нажим ${(fingerPressure * 100).toInt()}%") }
                 }
                 IconButton(onClick = { pad.fit() }) {
                     Icon(Icons.Rounded.Refresh, contentDescription = "Сбросить вид")
@@ -419,7 +429,7 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
                     }
                 },
                 confirmButton = {
-                    TextButton(onClick = { AppSettings.save(prefs); showSettings = false }) { Text("Готово") }
+                    TextButton(onClick = { AppSettings.save(prefs); fingerPressure = AppSettings.fingerPressure; showSettings = false }) { Text("Готово") }
                 },
             )
         }
