@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.net.wifi.WifiManager
 import android.os.SystemClock
 import java.io.DataInputStream
+import java.net.ConnectException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -164,6 +165,8 @@ class ScreenClient(
         private set
     @Volatile var currentMonitor = 0
         private set
+    @Volatile var problem = ""
+        private set
     @Volatile private var wantMonitor = -1
 
     // Без этого Wi-Fi уходит в энергосбережение и добавляет к задержке десятки миллисекунд
@@ -189,6 +192,27 @@ class ScreenClient(
         wantMonitor = num
     }
 
+    private fun inLocalNet(): Boolean = runCatching {
+        val subnets = localSubnets()
+        val a = InetAddress.getByName(host)
+        subnets.isEmpty() || a !is java.net.Inet4Address || !a.isSiteLocalAddress || subnets.any { it.contains(addressToInt(a)) }
+    }.getOrDefault(true)
+
+    // Что пошло не так, простыми словами; пустая строка - нечего подсказать
+    private fun explain(e: Exception, stage: Int, waited: Long): String = when {
+        !inLocalNet() -> "Адрес $host не из сети этого устройства. Компьютер и устройство должны быть в одной Wi-Fi сети."
+        stage == 0 && e is SocketTimeoutException ->
+            "Компьютер не отвечает. Проверьте, что Nerd запущен на компьютере и что его не блокирует брандмауэр Windows."
+        stage == 0 && e is ConnectException && e.message?.contains("refused", ignoreCase = true) == true ->
+            "Компьютер отвечает, но порт закрыт. Запустите Nerd на компьютере и разрешите его в брандмауэре."
+        stage == 0 ->
+            "Нет пути до компьютера. Возможно, он в другой сети, а в роутере включена изоляция устройств."
+        stage == 1 && e is SocketTimeoutException -> "Подтверждение на компьютере не получено."
+        stage == 1 && waited < 3000 ->
+            "Связь оборвалась сразу после соединения. Возможно, включён VPN или прокси, либо по этому адресу нет программы Nerd."
+        else -> "Связь потеряна, пробуем снова."
+    }
+
     // "NERD" | версия 2 | id 16 байт | ключ 16 байт | длина имени | имя
     private fun hello(): ByteArray {
         val name = identity.name.toByteArray().take(40).toByteArray()
@@ -199,6 +223,9 @@ class ScreenClient(
         while (running) {
             val s = Socket()
             var writer: Thread? = null
+            // 0 - соединяемся, 1 - ждём ответ после приветствия, 2 - идёт работа
+            var stage = 0
+            var waitAt = 0L
             try {
                 socket = s
                 state = ConnState.CONNECTING
@@ -211,6 +238,8 @@ class ScreenClient(
 
                 // Пока человек на компьютере нажимает «Разрешить», ждём ответ (до минуты)
                 state = ConnState.WAITING
+                stage = 1
+                waitAt = SystemClock.uptimeMillis()
                 s.soTimeout = 70_000
                 if (input.readUnsignedByte() == 0) {
                     state = ConnState.DENIED
@@ -232,6 +261,8 @@ class ScreenClient(
                 }
                 monitors = list
                 s.soTimeout = 0
+                stage = 2
+                problem = ""
 
                 val sentAt = ConcurrentLinkedQueue<Long>()
                 val slots = Semaphore(IN_FLIGHT)
@@ -284,6 +315,7 @@ class ScreenClient(
                 }
             } catch (e: Exception) {
                 // нет связи: пробуем снова
+                if (running) problem = explain(e, stage, SystemClock.uptimeMillis() - waitAt)
             } finally {
                 if (state != ConnState.DENIED) state = ConnState.CONNECTING
                 statsText = ""
@@ -298,13 +330,43 @@ class ScreenClient(
 
 class FoundPc(val name: String, val ip: String)
 
-// Ищет компьютеры с запущенной программой: рассылает «NERD?», ПК отвечает «NERD!имя»
+// Сеть этого устройства: адрес и длина маски (адрес в виде числа, старший байт первый)
+class Subnet(val ip: Int, val prefix: Int) {
+    val mask: Int get() = if (prefix == 0) 0 else -1 shl (32 - prefix)
+    val network: Int get() = ip and mask
+    val broadcast: Int get() = ip or mask.inv()
+    fun contains(other: Int) = (other and mask) == network
+}
+
+private fun intToAddress(v: Int): InetAddress =
+    InetAddress.getByAddress(byteArrayOf((v ushr 24).toByte(), (v ushr 16).toByte(), (v ushr 8).toByte(), v.toByte()))
+
+private fun addressToInt(a: InetAddress): Int = a.address.fold(0) { acc, b -> (acc shl 8) or (b.toInt() and 0xFF) }
+
+// Домашние сети (10.x, 172.16.x, 192.168.x) на Wi-Fi и кабеле; мобильный интернет и VPN не берём
+internal fun localSubnets(): List<Subnet> = runCatching {
+    java.net.NetworkInterface.getNetworkInterfaces().toList()
+        .filter { it.isUp && !it.isLoopback && listOf("rmnet", "ccmni", "tun", "ppp").none { p -> it.name.startsWith(p) } }
+        .flatMap { it.interfaceAddresses }
+        .filter { it.address is java.net.Inet4Address && it.address.isSiteLocalAddress }
+        .map { Subnet(addressToInt(it.address), it.networkPrefixLength.toInt().coerceIn(8, 30)) }
+}.getOrDefault(emptyList())
+
+// Ищет компьютеры с запущенной программой тремя путями: рассылка «NERD?», опрос каждого адреса своей сети
+// и приём объявлений «NERD!имя», которые ПК шлёт сам. ПК отвечает «NERD!имя».
 class Discovery(context: Context) {
     @Volatile var found: List<FoundPc> = emptyList()
         private set
     @Volatile private var running = true
     private val seen = ConcurrentHashMap<String, Pair<String, Long>>()
-    private val targets = broadcastAddresses(context)
+    private val subnets = localSubnets()
+    private val targets = listOf(InetAddress.getByName("255.255.255.255")) + subnets.map { intToAddress(it.broadcast) }
+
+    // Без этого часть устройств не пропускает к приложению широковещательные пакеты
+    private val multicastLock = runCatching {
+        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        wifi.createMulticastLock("nerd").apply { setReferenceCounted(false); acquire() }
+    }.getOrNull()
 
     init {
         Thread { loop() }.apply { isDaemon = true; start() }
@@ -312,20 +374,35 @@ class Discovery(context: Context) {
 
     fun stop() {
         running = false
+        runCatching { multicastLock?.release() }
+    }
+
+    // Все адреса своих сетей по очереди; если сеть шире /20, берём /20 вокруг устройства
+    private fun scanList(): List<InetAddress> = subnets.flatMap { s ->
+        val wide = if (s.prefix < 20) Subnet(s.ip, 20) else s
+        (wide.network + 1 until wide.broadcast).filter { it != s.ip }.map { intToAddress(it) }
     }
 
     private fun loop() {
-        val socket = DatagramSocket()
-        socket.broadcast = true
+        val socket = runCatching {
+            DatagramSocket(null).apply { reuseAddress = true; broadcast = true; bind(InetSocketAddress(DISCOVERY_PORT)) }
+        }.getOrElse { DatagramSocket().apply { broadcast = true } }
         socket.soTimeout = 300
         val ping = "NERD?".toByteArray()
         val buf = ByteArray(128)
+        val scan = scanList()
+        var next = 0
         var lastPing = 0L
         while (running) {
             var now = SystemClock.uptimeMillis()
             if (now - lastPing >= 1000) {
                 for (t in targets) runCatching { socket.send(DatagramPacket(ping, ping.size, t, DISCOVERY_PORT)) }
                 lastPing = now
+            }
+            // Опрос по одному адресу: работает там, где широковещание режется
+            repeat(minOf(128, scan.size)) {
+                runCatching { socket.send(DatagramPacket(ping, ping.size, scan[next], DISCOVERY_PORT)) }
+                next = (next + 1) % scan.size
             }
             try {
                 val p = DatagramPacket(buf, buf.size)
@@ -342,20 +419,4 @@ class Discovery(context: Context) {
         }
         socket.close()
     }
-}
-
-// Общий широковещательный адрес и адрес вашей Wi-Fi сети (на некоторых устройствах общий не доходит)
-private fun broadcastAddresses(context: Context): List<InetAddress> {
-    val list = mutableListOf(InetAddress.getByName("255.255.255.255"))
-    runCatching {
-        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        @Suppress("DEPRECATION")
-        val dhcp = wifi.dhcpInfo
-        val mask = if (dhcp.netmask != 0) dhcp.netmask else 0x00FFFFFF
-        if (dhcp.ipAddress != 0) {
-            val b = (dhcp.ipAddress and mask) or mask.inv()
-            list.add(InetAddress.getByAddress(byteArrayOf(b.toByte(), (b shr 8).toByte(), (b shr 16).toByte(), (b shr 24).toByte())))
-        }
-    }
-    return list
 }

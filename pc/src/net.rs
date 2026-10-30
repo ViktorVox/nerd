@@ -214,7 +214,7 @@ pub fn serve_screen() {
     }
 }
 
-// Устройство рассылает «NERD?» по локальной сети, ПК отвечает «NERD!» и своим именем
+// Устройство рассылает «NERD?» по локальной сети, ПК отвечает «NERD!» и своим именем; кроме того ПК сам шлёт такое объявление
 pub fn serve_discovery() {
     let Ok(sock) = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) else {
         log!("порт поиска {DISCOVERY_PORT} занят: устройство не найдёт ПК само");
@@ -222,8 +222,23 @@ pub fn serve_discovery() {
     };
     let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "ПК".into());
     let reply = format!("NERD!{name}");
-    let mut buf = [0u8; 16];
-    while let Ok((n, from)) = sock.recv_from(&mut buf) {
+    // ПК сам раз в секунду сообщает о себе всей сети: находится и там, где устройство не может достучаться первым
+    let beacon = reply.clone();
+    std::thread::spawn(move || {
+        let Ok(out) = UdpSocket::bind(("0.0.0.0", 0)) else { return };
+        let _ = out.set_broadcast(true);
+        loop {
+            let _ = out.send_to(beacon.as_bytes(), ("255.255.255.255", DISCOVERY_PORT));
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+    let mut buf = [0u8; 128];
+    loop {
+        // собственные объявления тоже приходят сюда; ошибка приёма (например, слишком длинный пакет) не должна останавливать поиск
+        let Ok((n, from)) = sock.recv_from(&mut buf) else {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
         if &buf[..n] == b"NERD?" {
             let _ = sock.send_to(reply.as_bytes(), from);
         }

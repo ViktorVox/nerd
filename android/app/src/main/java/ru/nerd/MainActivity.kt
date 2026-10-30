@@ -226,6 +226,7 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
     var fingerPressure by remember { mutableStateOf(AppSettings.fingerPressure) }
     var stats by remember { mutableStateOf("") }
     var state by remember { mutableStateOf(ConnState.CONNECTING) }
+    var problem by remember { mutableStateOf("") }
     var zoom by remember { mutableStateOf(1f) }
     var monitors by remember { mutableStateOf(emptyList<MonitorOption>()) }
     var currentMonitor by remember { mutableStateOf(0) }
@@ -245,6 +246,7 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
         while (true) {
             stats = client.statsText
             state = client.state
+            problem = client.problem
             zoom = pad.zoom
             monitors = client.monitors
             currentMonitor = client.currentMonitor
@@ -283,6 +285,9 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
                     else -> {
                         CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
                         Text("Подключение к $host…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (problem.isNotEmpty()) {
+                            Text(problem, color = MaterialTheme.colorScheme.onBackground, textAlign = TextAlign.Center)
+                        }
                     }
                 }
             }

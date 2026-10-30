@@ -5,6 +5,7 @@ mod capture;
 mod devtools;
 mod dialog;
 mod dxgi;
+mod firewall;
 mod log;
 mod menu;
 mod monitors;
@@ -31,5 +32,6 @@ fn main() {
     std::thread::spawn(net::serve_udp);
     std::thread::spawn(net::serve_screen);
     std::thread::spawn(net::serve_discovery);
+    std::thread::spawn(firewall::ensure);
     tray::run();
 }
