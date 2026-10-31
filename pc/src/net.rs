@@ -8,9 +8,12 @@ use crate::monitors::{self, Rect};
 use crate::pen::{self, Pen};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST,
+};
 
 const PORT: u16 = 47800;
 const SCREEN_PORT: u16 = 47801;
@@ -19,6 +22,7 @@ const DISCOVERY_PORT: u16 = 47802;
 static CLIENTS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn serve_udp() {
+    boost(THREAD_PRIORITY_HIGHEST);
     let Ok(mut pen) = Pen::new() else {
         log!("не удалось создать виртуальное перо (нужен Windows 10 1809 или новее)");
         return;
@@ -235,10 +239,18 @@ fn parse_video(req: &[u8; 24]) -> Video {
     }
 }
 
+// Потоки, от которых зависит отзывчивость, получают приоритет выше обычного: их не задерживают рисующие программы
+fn boost(level: THREAD_PRIORITY) {
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), level);
+    }
+}
+
 fn serve_video(mut s: TcpStream, first: Video) -> std::io::Result<()> {
+    boost(THREAD_PRIORITY_ABOVE_NORMAL);
     let shared = Arc::new(Mutex::new(first));
     let alive = Arc::new(AtomicBool::new(true));
-    let echo = Arc::new(AtomicU32::new(0));
+    let echo = Arc::new(Mutex::new((0u32, Instant::now())));
     let mut reader = s.try_clone()?;
     {
         let (shared, alive, echo) = (shared.clone(), alive.clone(), echo.clone());
@@ -271,7 +283,7 @@ fn serve_video(mut s: TcpStream, first: Video) -> std::io::Result<()> {
                         let mut t = [0u8; 4];
                         let ok = reader.read_exact(&mut t).is_ok();
                         if ok {
-                            echo.store(u32::from_le_bytes(t), Ordering::SeqCst);
+                            *echo.lock().unwrap() = (u32::from_le_bytes(t), Instant::now());
                         }
                         ok
                     }
@@ -289,12 +301,14 @@ fn serve_video(mut s: TcpStream, first: Video) -> std::io::Result<()> {
     let mut gpu = Dxgi::new(monitors::rect(), seed(monitors::rect()));
     let mut enc: Option<(H264, Video)> = None;
     let (mut hardware_ok, mut fails) = (true, 0u32);
+    let mut last: Option<(Vec<u8>, [f32; 4], (f32, f32), Instant)> = None;
     let (mut seq, mut frames, mut bytes) = (0u32, 0u32, 0usize);
     let mut spent = Duration::ZERO;
     let mut since = Instant::now();
     log!("видеопоток H.264, захват: {}", if gpu.is_some() { "видеокарта (DXGI)" } else { "GDI" });
+    let mut last_check = Instant::now();
+    let mut dirty = true;
     while alive.load(Ordering::SeqCst) {
-        let t0 = Instant::now();
         let v = *shared.lock().unwrap();
         // кодер пересоздаётся при смене размера, битрейта или частоты кадров; программному больше 30 к/с не по силам
         let same = enc.as_ref().is_some_and(|(e, c)| {
@@ -320,12 +334,44 @@ fn serve_video(mut s: TcpStream, first: Video) -> std::io::Result<()> {
                 built.1.kbps
             );
             enc = Some(built);
+            last = None;
         }
         if generation != monitors::generation() {
             generation = monitors::generation();
             gpu = Dxgi::new(monitors::rect(), seed(monitors::rect()));
+            last = None;
         }
         let mon = monitors::rect();
+        let interval = Duration::from_micros(1_000_000 / enc.as_ref().map_or(v.fps, |(_, c)| c.fps) as u64);
+        let region_moved = last.as_ref().map_or(true, |(_, r, _, _)| *r != v.region);
+
+        // Ждём, пока видеокарта сообщит об изменении экрана или курсора: так кадр уходит сразу, а в простое процессор свободен
+        match gpu.as_mut().map(|g| g.wait(if region_moved { 0 } else { 4 })) {
+            Some(Some(fresh)) => dirty |= fresh,
+            Some(None) => {
+                gpu = Dxgi::new(mon, seed(mon));
+                dirty = true;
+            }
+            None => {
+                // без видеокарты событий нет: смотрим экран с заданной частотой
+                dirty = true;
+                std::thread::sleep(interval);
+            }
+        }
+        let cursor = cursor_fraction(mon);
+        let cursor_moved = last.as_ref().map_or(true, |(_, _, c, _)| *c != cursor);
+        // Событие могло не прийти (например, изменилось не то, что видно): раз в 0,1 с смотрим кадр всё равно
+        if !(dirty || cursor_moved || region_moved || last_check.elapsed() >= Duration::from_millis(100)) {
+            continue;
+        }
+        // не чаще заданной частоты кадров
+        if let Some((_, _, _, at)) = &last {
+            std::thread::sleep(interval.saturating_sub(at.elapsed()));
+        }
+        let t0 = Instant::now();
+        dirty = false;
+        last_check = t0;
+
         let (x0, y0, w, h) = mon;
         let [rx, ry, rw, rh] = v.region;
         let sx = x0 + (rx * w as f32) as i32;
@@ -345,6 +391,11 @@ fn serve_video(mut s: TcpStream, first: Video) -> std::io::Result<()> {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         };
+        // Кадр, курсор и область те же: не кодируем и не шлём (раз в 0,5 с шлём один, чтобы поток не молчал)
+        let keepalive = last.as_ref().map_or(true, |(_, _, _, at)| at.elapsed() >= Duration::from_millis(500));
+        if !keepalive && last.as_ref().is_some_and(|(b, r, c, _)| *b == buf && *r == v.region && *c == cursor) {
+            continue;
+        }
         let Some(data) = enc.as_mut().and_then(|(e, _)| e.encode(&buf, key)) else {
             fails += 1;
             // кодер видеокарты не справляется: дальше работаем программным
@@ -352,28 +403,32 @@ fn serve_video(mut s: TcpStream, first: Video) -> std::io::Result<()> {
                 log!("видеопоток: кодер видеокарты не выдаёт кадры, переходим на процессор");
                 hardware_ok = false;
                 enc = None;
+                last = None;
                 fails = 0;
             }
             std::thread::sleep(Duration::from_millis(20));
             continue;
         };
         fails = 0;
-        let mut head = Vec::with_capacity(44);
+        // заголовок и кадр одним куском: один пакет вместо двух
+        let mut msg = Vec::with_capacity(44 + data.len());
         for x in v.region {
-            head.extend_from_slice(&x.to_le_bytes());
+            msg.extend_from_slice(&x.to_le_bytes());
         }
-        head.extend_from_slice(&(w as u16).to_le_bytes());
-        head.extend_from_slice(&(h as u16).to_le_bytes());
-        head.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        let (cx, cy) = cursor_fraction(mon);
-        head.extend_from_slice(&cx.to_le_bytes());
-        head.extend_from_slice(&cy.to_le_bytes());
-        head.extend_from_slice(&seq.to_le_bytes());
-        head.extend_from_slice(&(v.ow as u16).to_le_bytes());
-        head.extend_from_slice(&(v.oh as u16).to_le_bytes());
-        head.extend_from_slice(&echo.load(Ordering::SeqCst).to_le_bytes());
-        s.write_all(&head)?;
-        s.write_all(&data)?;
+        msg.extend_from_slice(&(w as u16).to_le_bytes());
+        msg.extend_from_slice(&(h as u16).to_le_bytes());
+        msg.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        msg.extend_from_slice(&cursor.0.to_le_bytes());
+        msg.extend_from_slice(&cursor.1.to_le_bytes());
+        msg.extend_from_slice(&seq.to_le_bytes());
+        msg.extend_from_slice(&(v.ow as u16).to_le_bytes());
+        msg.extend_from_slice(&(v.oh as u16).to_le_bytes());
+        // метка устройства плюс время, которое она пролежала у нас: устройство вычтет это из задержки
+        let (stamp, at) = *echo.lock().unwrap();
+        msg.extend_from_slice(&stamp.wrapping_add(at.elapsed().as_millis() as u32).to_le_bytes());
+        msg.extend_from_slice(&data);
+        s.write_all(&msg)?;
+        last = Some((buf, v.region, cursor, Instant::now()));
         seq = seq.wrapping_add(1);
         frames += 1;
         bytes += data.len();
@@ -388,9 +443,6 @@ fn serve_video(mut s: TcpStream, first: Video) -> std::io::Result<()> {
             );
             (frames, bytes, spent, since) = (0, 0, Duration::ZERO, Instant::now());
         }
-        let fps = enc.as_ref().map_or(v.fps, |(_, c)| c.fps);
-        let interval = Duration::from_micros(1_000_000 / fps as u64);
-        std::thread::sleep(interval.saturating_sub(t0.elapsed()));
     }
     Ok(())
 }

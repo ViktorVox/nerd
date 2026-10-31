@@ -103,8 +103,12 @@ impl H264 {
                 };
                 set(&CODECAPI_AVLowLatencyMode, var_bool(true));
                 set(&CODECAPI_AVEncCommonRealTime, var_bool(true));
-                set(&CODECAPI_AVEncCommonRateControlMode, var_u32(0));
+                // Видеокарте разрешаем тратить меньше целевого на неподвижной картинке (переменный битрейт с потолком)
+                set(&CODECAPI_AVEncCommonRateControlMode, var_u32(if hardware { 1 } else { 0 }));
                 set(&CODECAPI_AVEncCommonMeanBitRate, var_u32(kbps * 1000));
+                if hardware {
+                    set(&CODECAPI_AVEncCommonMaxBitRate, var_u32(kbps * 1500));
+                }
                 set(&CODECAPI_AVEncMPVGOPSize, var_u32(fps * 10));
                 set(&CODECAPI_AVEncMPVDefaultBPictureCount, var_u32(0));
                 if !hardware {
@@ -299,24 +303,32 @@ impl Drop for H264 {
     }
 }
 
-// Яркость и цвет по BT.601 (ограниченный диапазон); цвет берётся средним из четырёх пикселей
+// Яркость и цвет по BT.601 (ограниченный диапазон); цвет считается один раз на блок 2 x 2 по сумме четырёх пикселей
 fn convert_band(src: &[u8], w: usize, first: usize, y: &mut [u8], uv: &mut [u8]) {
+    let luma = |r: i32, g: i32, b: i32| (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
     for pair in 0..y.len() / w / 2 {
         let r0 = (first + pair * 2) * w * 4;
-        let r1 = r0 + w * 4;
-        for x in (0..w).step_by(2) {
-            let (mut su, mut sv) = (0i32, 0i32);
-            for (dy, row) in [r0, r1].into_iter().enumerate() {
-                for dx in 0..2 {
-                    let i = row + (x + dx) * 4;
-                    let (b, g, r) = (src[i] as i32, src[i + 1] as i32, src[i + 2] as i32);
-                    y[(pair * 2 + dy) * w + x + dx] = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
-                    su += ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                    sv += ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                }
-            }
-            uv[pair * w + x] = (su / 4).clamp(0, 255) as u8;
-            uv[pair * w + x + 1] = (sv / 4).clamp(0, 255) as u8;
+        let (a, b) = (&src[r0..r0 + w * 4], &src[r0 + w * 4..r0 + w * 8]);
+        let (ya, yb) = y[pair * 2 * w..(pair * 2 + 2) * w].split_at_mut(w);
+        let chroma = &mut uv[pair * w..(pair + 1) * w];
+        for ((((pa, pb), la), lb), c) in a
+            .chunks_exact(8)
+            .zip(b.chunks_exact(8))
+            .zip(ya.chunks_exact_mut(2))
+            .zip(yb.chunks_exact_mut(2))
+            .zip(chroma.chunks_exact_mut(2))
+        {
+            let (b0, g0, r0) = (pa[0] as i32, pa[1] as i32, pa[2] as i32);
+            let (b1, g1, r1) = (pa[4] as i32, pa[5] as i32, pa[6] as i32);
+            let (b2, g2, r2) = (pb[0] as i32, pb[1] as i32, pb[2] as i32);
+            let (b3, g3, r3) = (pb[4] as i32, pb[5] as i32, pb[6] as i32);
+            la[0] = luma(r0, g0, b0);
+            la[1] = luma(r1, g1, b1);
+            lb[0] = luma(r2, g2, b2);
+            lb[1] = luma(r3, g3, b3);
+            let (sr, sg, sb) = (r0 + r1 + r2 + r3, g0 + g1 + g2 + g3, b0 + b1 + b2 + b3);
+            c[0] = (((-38 * sr - 74 * sg + 112 * sb + 512) >> 10) + 128).clamp(0, 255) as u8;
+            c[1] = (((112 * sr - 94 * sg - 18 * sb + 512) >> 10) + 128).clamp(0, 255) as u8;
         }
     }
 }
@@ -331,4 +343,38 @@ fn bgra_to_nv12(src: &[u8], w: usize, h: usize, dst: &mut Vec<u8>) {
             s.spawn(move || convert_band(src, w, i * pairs * 2, yb, uvb));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn solid(w: usize, h: usize, b: u8, g: u8, r: u8) -> Vec<u8> {
+        (0..w * h).flat_map(|_| [b, g, r, 255]).collect()
+    }
+
+    #[test]
+    fn nv12_known_colors() {
+        // красный: Y 82, U 90, V 240; белый: Y 235, U 128, V 128; чёрный: Y 16, U 128, V 128
+        for ((b, g, r), (ey, eu, ev)) in [((0, 0, 255), (82, 90, 240)), ((255, 255, 255), (235, 128, 128)), ((0, 0, 0), (16, 128, 128))] {
+            let (w, h) = (32, 18);
+            let mut out = Vec::new();
+            bgra_to_nv12(&solid(w, h, b, g, r), w, h, &mut out);
+            assert_eq!(out.len(), w * h * 3 / 2);
+            assert!(out[..w * h].iter().all(|&y| y == ey), "Y для ({r},{g},{b})");
+            assert!(out[w * h..].chunks(2).all(|c| c[0] == eu && c[1] == ev), "UV для ({r},{g},{b})");
+        }
+    }
+
+    #[test]
+    fn nv12_rows_split_between_threads_stay_in_place() {
+        // верхняя половина красная, нижняя белая: строки не должны перепутаться между потоками
+        let (w, h) = (16, 40);
+        let mut src = solid(w, h / 2, 0, 0, 255);
+        src.extend(solid(w, h / 2, 255, 255, 255));
+        let mut out = Vec::new();
+        bgra_to_nv12(&src, w, h, &mut out);
+        assert!(out[..w * h / 2].iter().all(|&y| y == 82));
+        assert!(out[w * h / 2..w * h].iter().all(|&y| y == 235));
+    }
 }

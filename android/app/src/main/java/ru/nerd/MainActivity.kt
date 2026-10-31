@@ -12,6 +12,8 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.KeyboardArrowUp
+import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.Redo
 import androidx.compose.material.icons.rounded.Remove
 import androidx.compose.material.icons.rounded.RotateLeft
@@ -22,6 +24,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Slider
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -221,6 +225,16 @@ private fun ConnectScreen(last: String, auto: Boolean, onConnect: (String) -> Un
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
+// Нажатие в этом месте сообщается, но не перехватывается
+private fun Modifier.onPress(action: () -> Unit): Modifier = pointerInput(Unit) {
+    awaitPointerEventScope {
+        while (true) {
+            val e = awaitPointerEvent(PointerEventPass.Initial)
+            if (e.type == PointerEventType.Press) action()
+        }
+    }
+}
+
 @Composable
 private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -242,6 +256,15 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
     var currentMonitor by remember { mutableStateOf(0) }
     var menuOpen by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
+    var panelsVisible by remember { mutableStateOf(true) }
+    var panelTouches by remember { mutableStateOf(0) }
+    var hideAfter by remember { mutableStateOf(AppSettings.panelHideSeconds) }
+    LaunchedEffect(panelsVisible, panelTouches, hideAfter, showSettings, menuOpen) {
+        if (panelsVisible && hideAfter > 0 && !showSettings && !menuOpen) {
+            delay(hideAfter * 1000L)
+            panelsVisible = false
+        }
+    }
     var ctrl by remember { mutableStateOf(false) }
     var shift by remember { mutableStateOf(false) }
     var spaceDown by remember { mutableStateOf(false) }
@@ -304,120 +327,137 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
             }
         }
 
-        Surface(
-            shape = RoundedCornerShape(28.dp),
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
-            tonalElevation = 6.dp,
-            modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 8.dp),
-        ) {
-            Row(
-                modifier = Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
+        if (panelsVisible) {
+            Surface(
+                shape = RoundedCornerShape(28.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+                tonalElevation = 6.dp,
+                modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 8.dp).onPress { panelTouches++ },
             ) {
-                SingleChoiceSegmentedButtonRow {
-                    Mode.entries.forEachIndexed { index, m ->
-                        SegmentedButton(
-                            selected = mode == m,
-                            onClick = { mode = m; pad.mode = m },
-                            shape = SegmentedButtonDefaults.itemShape(index, Mode.entries.size),
-                        ) { Text(m.title) }
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    SingleChoiceSegmentedButtonRow {
+                        Mode.entries.forEachIndexed { index, m ->
+                            SegmentedButton(
+                                selected = mode == m,
+                                onClick = { mode = m; pad.mode = m },
+                                shape = SegmentedButtonDefaults.itemShape(index, Mode.entries.size),
+                            ) { Text(m.title) }
+                        }
                     }
-                }
-                if (mode == Mode.DRAW) {
-                    TextButton(onClick = {
-                        val next = Math.round(fingerPressure * 5) % 5 + 1
-                        fingerPressure = next / 5f
-                        AppSettings.fingerPressure = fingerPressure
-                        AppSettings.save(prefsQuick)
-                    }) { Text("Нажим ${(fingerPressure * 100).toInt()}%") }
-                }
-                IconButton(onClick = { pad.fit() }) {
-                    Icon(Icons.Rounded.Refresh, contentDescription = "Сбросить вид")
-                }
-                IconButton(onClick = { showSettings = true }) {
-                    Icon(Icons.Rounded.Settings, contentDescription = "Настройки")
-                }
-                if (monitors.size > 1) {
-                    Box {
-                        TextButton(onClick = { menuOpen = true }) { Text("Монитор $currentMonitor ▾") }
-                        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                            monitors.forEach { m ->
-                                DropdownMenuItem(
-                                    text = { Text("Монитор ${m.num} · ${m.w}×${m.h}") },
-                                    onClick = { menuOpen = false; client.selectMonitor(m.num) },
-                                )
+                    if (mode == Mode.DRAW) {
+                        TextButton(onClick = {
+                            val next = Math.round(fingerPressure * 5) % 5 + 1
+                            fingerPressure = next / 5f
+                            AppSettings.fingerPressure = fingerPressure
+                            AppSettings.save(prefsQuick)
+                        }) { Text("Нажим ${(fingerPressure * 100).toInt()}%") }
+                    }
+                    IconButton(onClick = { pad.fit() }) {
+                        Icon(Icons.Rounded.Refresh, contentDescription = "Сбросить вид")
+                    }
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Rounded.Settings, contentDescription = "Настройки")
+                    }
+                    if (monitors.size > 1) {
+                        Box {
+                            TextButton(onClick = { menuOpen = true }) { Text("Монитор $currentMonitor ▾") }
+                            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                                monitors.forEach { m ->
+                                    DropdownMenuItem(
+                                        text = { Text("Монитор ${m.num} · ${m.w}×${m.h}") },
+                                        onClick = { menuOpen = false; client.selectMonitor(m.num) },
+                                    )
+                                }
                             }
                         }
                     }
+                    if (state == ConnState.CONNECTED) {
+                        Text(
+                            "×%.1f".format(zoom) + if (stats.isNotEmpty()) " · $stats" else "",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 4.dp),
+                        )
+                    }
+                    IconButton(onClick = { panelsVisible = false }) {
+                        Icon(Icons.Rounded.KeyboardArrowUp, contentDescription = "Скрыть панели")
+                    }
+                    IconButton(onClick = onExit) {
+                        Icon(Icons.Rounded.Close, contentDescription = "Отключиться")
+                    }
                 }
-                if (state == ConnState.CONNECTED) {
-                    Text(
-                        "×%.1f".format(zoom) + if (stats.isNotEmpty()) " · $stats" else "",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 4.dp),
+            }
+
+            // Нижняя панель: быстрые клавиши для Krita и других программ рисования
+            Surface(
+                shape = RoundedCornerShape(28.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+                tonalElevation = 6.dp,
+                modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 8.dp, start = 8.dp, end = 8.dp).onPress { panelTouches++ },
+            ) {
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    IconButton(onClick = { sender.undo() }) { Icon(Icons.Rounded.Undo, contentDescription = "Отменить") }
+                    IconButton(onClick = { sender.redo() }) { Icon(Icons.Rounded.Redo, contentDescription = "Вернуть") }
+                    Spacer(Modifier.width(6.dp))
+                    IconButton(onClick = { sender.combo(VK_BRACKET_LEFT) }) { Icon(Icons.Rounded.Remove, contentDescription = "Кисть меньше") }
+                    IconButton(onClick = { sender.combo(VK_BRACKET_RIGHT) }) { Icon(Icons.Rounded.Add, contentDescription = "Кисть больше") }
+                    TextButton(onClick = { sender.combo(VK_E) }) { Text("Ластик") }
+                    Spacer(Modifier.width(6.dp))
+                    IconButton(onClick = { sender.rotateCanvas(false) }) { Icon(Icons.Rounded.RotateLeft, contentDescription = "Повернуть холст влево") }
+                    IconButton(onClick = { sender.rotateCanvas(true) }) { Icon(Icons.Rounded.RotateRight, contentDescription = "Повернуть холст вправо") }
+                    Spacer(Modifier.width(6.dp))
+                    FilterChip(
+                        selected = ctrl,
+                        onClick = { ctrl = !ctrl; sender.key(VK_CTRL, ctrl) },
+                        label = { Text("Ctrl") },
                     )
-                }
-                IconButton(onClick = onExit) {
-                    Icon(Icons.Rounded.Close, contentDescription = "Отключиться")
+                    FilterChip(
+                        selected = shift,
+                        onClick = { shift = !shift; sender.key(VK_SHIFT, shift) },
+                        label = { Text("Shift") },
+                    )
+                    // Пробел работает, пока кнопка удерживается: так двигают холст в Krita
+                    val chip = RoundedCornerShape(8.dp)
+                    Box(
+                        modifier = Modifier
+                            .height(32.dp)
+                            .clip(chip)
+                            .background(if (spaceDown) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
+                            .border(1.dp, MaterialTheme.colorScheme.outline, chip)
+                            .padding(horizontal = 14.dp)
+                            .pointerInput(Unit) {
+                                detectTapGestures(onPress = {
+                                    spaceDown = true
+                                    sender.key(VK_SPACE, true)
+                                    try { awaitRelease() } finally {
+                                        spaceDown = false
+                                        sender.key(VK_SPACE, false)
+                                    }
+                                })
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) { Text("Пробел", style = MaterialTheme.typography.labelLarge) }
                 }
             }
         }
 
-        // Нижняя панель: быстрые клавиши для Krita и других программ рисования
-        Surface(
-            shape = RoundedCornerShape(28.dp),
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
-            tonalElevation = 6.dp,
-            modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 8.dp, start = 8.dp, end = 8.dp),
-        ) {
-            Row(
-                modifier = Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
+        if (!panelsVisible) {
+            Surface(
+                shape = RoundedCornerShape(50),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.55f),
+                modifier = Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(8.dp),
             ) {
-                IconButton(onClick = { sender.undo() }) { Icon(Icons.Rounded.Undo, contentDescription = "Отменить") }
-                IconButton(onClick = { sender.redo() }) { Icon(Icons.Rounded.Redo, contentDescription = "Вернуть") }
-                Spacer(Modifier.width(6.dp))
-                IconButton(onClick = { sender.combo(VK_BRACKET_LEFT) }) { Icon(Icons.Rounded.Remove, contentDescription = "Кисть меньше") }
-                IconButton(onClick = { sender.combo(VK_BRACKET_RIGHT) }) { Icon(Icons.Rounded.Add, contentDescription = "Кисть больше") }
-                TextButton(onClick = { sender.combo(VK_E) }) { Text("Ластик") }
-                Spacer(Modifier.width(6.dp))
-                IconButton(onClick = { sender.rotateCanvas(false) }) { Icon(Icons.Rounded.RotateLeft, contentDescription = "Повернуть холст влево") }
-                IconButton(onClick = { sender.rotateCanvas(true) }) { Icon(Icons.Rounded.RotateRight, contentDescription = "Повернуть холст вправо") }
-                Spacer(Modifier.width(6.dp))
-                FilterChip(
-                    selected = ctrl,
-                    onClick = { ctrl = !ctrl; sender.key(VK_CTRL, ctrl) },
-                    label = { Text("Ctrl") },
-                )
-                FilterChip(
-                    selected = shift,
-                    onClick = { shift = !shift; sender.key(VK_SHIFT, shift) },
-                    label = { Text("Shift") },
-                )
-                // Пробел работает, пока кнопка удерживается: так двигают холст в Krita
-                val chip = RoundedCornerShape(8.dp)
-                Box(
-                    modifier = Modifier
-                        .height(32.dp)
-                        .clip(chip)
-                        .background(if (spaceDown) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
-                        .border(1.dp, MaterialTheme.colorScheme.outline, chip)
-                        .padding(horizontal = 14.dp)
-                        .pointerInput(Unit) {
-                            detectTapGestures(onPress = {
-                                spaceDown = true
-                                sender.key(VK_SPACE, true)
-                                try { awaitRelease() } finally {
-                                    spaceDown = false
-                                    sender.key(VK_SPACE, false)
-                                }
-                            })
-                        },
-                    contentAlignment = Alignment.Center,
-                ) { Text("Пробел", style = MaterialTheme.typography.labelLarge) }
+                IconButton(onClick = { panelsVisible = true }) {
+                    Icon(Icons.Rounded.Menu, contentDescription = "Показать панели")
+                }
             }
         }
 
@@ -426,6 +466,7 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
             var quality by remember { mutableStateOf(AppSettings.quality) }
             var pressure by remember { mutableStateOf(AppSettings.fingerPressure) }
             var useVideo by remember { mutableStateOf(AppSettings.video) }
+            var hide by remember { mutableStateOf(AppSettings.panelHideSeconds) }
             AlertDialog(
                 onDismissRequest = { showSettings = false },
                 title = { Text("Настройки") },
@@ -447,10 +488,20 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
                             Text("Видео H.264 (меньше трафика и задержки). Применится при следующем подключении.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
                             Switch(checked = useVideo, onCheckedChange = { useVideo = it; AppSettings.video = it })
                         }
+                        Text(
+                            if (hide == 0) "Скрывать панели: никогда" else "Скрывать панели через: $hide с",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Slider(
+                            value = hide.toFloat(),
+                            onValueChange = { hide = it.toInt(); AppSettings.panelHideSeconds = hide },
+                            valueRange = 0f..30f,
+                            steps = 29,
+                        )
                     }
                 },
                 confirmButton = {
-                    TextButton(onClick = { AppSettings.save(prefs); fingerPressure = AppSettings.fingerPressure; showSettings = false }) { Text("Готово") }
+                    TextButton(onClick = { AppSettings.save(prefs); fingerPressure = AppSettings.fingerPressure; hideAfter = AppSettings.panelHideSeconds; showSettings = false }) { Text("Готово") }
                 },
             )
         }

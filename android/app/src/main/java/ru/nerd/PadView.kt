@@ -117,8 +117,25 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
         return b.array()
     }
 
-    fun onVideoFrame(m: VideoMeta) =
+    fun onVideoFrame(m: VideoMeta) {
         onFrame(Frame(null, m.x, m.y, m.w, m.h, m.cursorX, m.cursorY), SystemClock.uptimeMillis() - m.lagMs, m.monW.toFloat(), m.monH.toFloat())
+        applyVideoTransform()
+    }
+
+    // Куда на экране ложится картинка видео: общая область кадра, вид (сдвиг и масштаб) двигается локально
+    private fun applyVideoTransform() {
+        val f = frame ?: return
+        val v = videoView ?: return
+        if (f.bmp != null || width == 0 || height == 0) return
+        val left = (f.x * monW - ox) * scale
+        val top = (f.y * monH - oy) * scale
+        val right = ((f.x + f.w) * monW - ox) * scale
+        val bottom = ((f.y + f.h) * monH - oy) * scale
+        v.alpha = 1f
+        videoMatrix.setScale((right - left) / width, (bottom - top) / height)
+        videoMatrix.postTranslate(left, top)
+        v.setTransform(videoMatrix)
+    }
 
     val zoom: Float get() = if (fitScale > 0f) scale / fitScale else 1f
 
@@ -228,12 +245,7 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
             if (bmp != null) {
                 videoView?.alpha = 0f
                 c.drawBitmap(bmp, null, dst, bitmapPaint)
-            } else videoView?.let { v ->
-                v.alpha = 1f
-                videoMatrix.setScale(dst.width() / width, dst.height() / height)
-                videoMatrix.postTranslate(dst.left, dst.top)
-                v.setTransform(videoMatrix)
-            }
+            } else applyVideoTransform()
         }
         frame?.let {
             // В режиме «Мышь» показываем, где сейчас курсор Windows
@@ -383,6 +395,8 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
     }
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
+        // События касаний приходят сразу, а не пачкой раз в кадр: перо и палец отзываются на несколько миллисекунд раньше
+        if (e.actionMasked == MotionEvent.ACTION_DOWN) requestUnbufferedDispatch(e)
         if (e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS) return stylus(e)
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {

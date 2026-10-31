@@ -123,6 +123,11 @@ impl Dxgi {
         }
     }
 
+    // Ждёт до timeout_ms, пока видеокарта отдаст новую картинку экрана (или сообщит о курсоре); Some(true) - картинка обновилась
+    pub fn wait(&mut self, timeout_ms: u32) -> Option<bool> {
+        self.refresh(timeout_ms)
+    }
+
     // Область (sx, sy, sw, sh относительно монитора), приведённая к ow x oh, пиксели BGRA
     pub fn grab(&mut self, sx: i32, sy: i32, sw: i32, sh: i32, ow: i32, oh: i32) -> Option<Vec<u8>> {
         self.refresh(0)?;
@@ -163,7 +168,18 @@ unsafe impl Sync for SrcPtr {}
 // Усреднение пикселей исходной области на каждый пиксель результата (при увеличении получается ближайший сосед).
 // Строки результата делятся между потоками.
 unsafe fn resample(src: *const u8, pitch: usize, sw: usize, sh: usize, ow: usize, oh: usize) -> Vec<u8> {
-    let mut dst = vec![0u8; ow * oh * 4];
+    let mut dst = Vec::<u8>::with_capacity(ow * oh * 4);
+    // Без изменения размера строки копируются как есть
+    if sw == ow && sh == oh {
+        for y in 0..oh {
+            std::ptr::copy_nonoverlapping(src.add(y * pitch), dst.as_mut_ptr().add(y * ow * 4), ow * 4);
+        }
+        dst.set_len(ow * oh * 4);
+        return dst;
+    }
+    dst.resize(ow * oh * 4, 0);
+    // Деление на число пикселей заменено умножением на обратную величину: деление на каждый канал каждого пикселя дорого
+    let inv: Vec<u32> = (0..=256u32).map(|n| if n == 0 { 0 } else { (65536 + n - 1) / n }).collect();
     let cols: Vec<(usize, usize)> = (0..ow)
         .map(|x| {
             let a = x * sw / ow;
@@ -173,7 +189,7 @@ unsafe fn resample(src: *const u8, pitch: usize, sw: usize, sh: usize, ow: usize
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
     let rows = oh.div_ceil(threads);
     let src = SrcPtr(src);
-    let (src, cols) = (&src, &cols);
+    let (src, cols, inv) = (&src, &cols, &inv);
     std::thread::scope(|scope| {
         for (t, part) in dst.chunks_mut(rows * ow * 4).enumerate() {
             scope.spawn(move || {
@@ -193,11 +209,19 @@ unsafe fn resample(src: *const u8, pitch: usize, sw: usize, sh: usize, ow: usize
                                 r += *p.add(2) as u32;
                             }
                         }
-                        let n = ((yb - ya) * (xb - xa)) as u32;
-                        line[ox * 4] = (b / n) as u8;
-                        line[ox * 4 + 1] = (g / n) as u8;
-                        line[ox * 4 + 2] = (r / n) as u8;
-                        line[ox * 4 + 3] = 255;
+                        let n = ((yb - ya) * (xb - xa)) as usize;
+                        let px = &mut line[ox * 4..ox * 4 + 4];
+                        if n <= 256 {
+                            let k = inv[n];
+                            px[0] = ((b * k) >> 16) as u8;
+                            px[1] = ((g * k) >> 16) as u8;
+                            px[2] = ((r * k) >> 16) as u8;
+                        } else {
+                            px[0] = (b / n as u32) as u8;
+                            px[1] = (g / n as u32) as u8;
+                            px[2] = (r / n as u32) as u8;
+                        }
+                        px[3] = 255;
                     }
                 }
             });

@@ -33,15 +33,17 @@ object AppSettings {
     @Volatile var quality = 60
     @Volatile var fingerPressure = 0.6f
     @Volatile var video = true
+    @Volatile var panelHideSeconds = 5
 
     fun load(prefs: android.content.SharedPreferences) {
         quality = prefs.getInt("quality", 60)
         fingerPressure = prefs.getFloat("finger_pressure", 0.6f)
         video = prefs.getBoolean("video", true)
+        panelHideSeconds = prefs.getInt("panel_hide", 5)
     }
 
     fun save(prefs: android.content.SharedPreferences) {
-        prefs.edit().putInt("quality", quality).putFloat("finger_pressure", fingerPressure).putBoolean("video", video).apply()
+        prefs.edit().putInt("quality", quality).putFloat("finger_pressure", fingerPressure).putBoolean("video", video).putInt("panel_hide", panelHideSeconds).apply()
     }
 }
 
@@ -75,6 +77,7 @@ class Sender(host: String) {
 
     init {
         Thread {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
             while (true) {
                 val b = queue.take()
                 socket.send(DatagramPacket(b, b.size, address, PORT))
@@ -314,6 +317,7 @@ class ScreenClient(
     }
 
     private fun loop() {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
         while (running) {
             val s = Socket()
             var writer: Thread? = null

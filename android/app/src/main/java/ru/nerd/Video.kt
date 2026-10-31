@@ -3,6 +3,8 @@ package ru.nerd
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.view.Surface
 import java.util.concurrent.ConcurrentHashMap
 
@@ -24,6 +26,7 @@ class VideoDecoder(surface: Surface, val width: Int, val height: Int, private va
     private val codec = MediaCodec.createDecoderByType("video/avc")
     private val metas = ConcurrentHashMap<Long, VideoMeta>()
     @Volatile private var running = true
+    private val main = Handler(Looper.getMainLooper())
 
     init {
         val format = MediaFormat.createVideoFormat("video/avc", width, height)
@@ -55,13 +58,22 @@ class VideoDecoder(surface: Surface, val width: Int, val height: Int, private va
     }
 
     private fun drain() {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
         val info = MediaCodec.BufferInfo()
         while (running) {
             try {
                 val i = codec.dequeueOutputBuffer(info, 10_000)
                 if (i < 0) continue
-                codec.releaseOutputBuffer(i, true)
-                metas.remove(info.presentationTimeUs)?.let(onShown)
+                val meta = metas.remove(info.presentationTimeUs)
+                if (meta == null) {
+                    codec.releaseOutputBuffer(i, true)
+                } else {
+                    // кадр и его положение на экране меняются в одном месте главного потока, иначе картинка на миг «прыгает»
+                    main.post {
+                        if (running) onShown(meta)
+                        runCatching { codec.releaseOutputBuffer(i, running) }
+                    }
+                }
                 if (metas.size > 64) metas.keys.sorted().dropLast(32).forEach { metas.remove(it) }
             } catch (e: Exception) {
                 if (!running) break

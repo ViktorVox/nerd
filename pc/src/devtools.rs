@@ -152,12 +152,21 @@ fn h264_test(args: &[String]) {
     );
     if let Some(mut enc) = enc {
         let (mut cap_t, mut enc_t, mut stream, mut sizes) = (0.0f32, 0.0f32, Vec::new(), Vec::new());
+        // --static: один и тот же кадр 90 раз, чтобы мерить расход на неподвижной картинке
+        let still = args.iter().any(|a| a == "--static");
+        let mut cached: Option<Vec<u8>> = None;
         for i in 0..frames {
             let t0 = Instant::now();
-            let shot = gpu
-                .as_mut()
-                .and_then(|g| g.grab(0, 0, mon.2, mon.3, ow, oh))
-                .or_else(|| capture_gdi(mon.0, mon.1, mon.2, mon.3, ow, oh));
+            let shot = match cached.clone().filter(|_| still) {
+                Some(f) => Some(f),
+                None => gpu
+                    .as_mut()
+                    .and_then(|g| g.grab(0, 0, mon.2, mon.3, ow, oh))
+                    .or_else(|| capture_gdi(mon.0, mon.1, mon.2, mon.3, ow, oh)),
+            };
+            if still && cached.is_none() {
+                cached = shot.clone();
+            }
             cap_t += t0.elapsed().as_secs_f32();
             let t1 = Instant::now();
             if let Some(Some(d)) = shot.map(|b| enc.encode(&b, i == 0)) {
