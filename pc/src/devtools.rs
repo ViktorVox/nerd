@@ -16,6 +16,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 pub fn run(args: &[String]) -> bool {
     let has = |f: &str| args.iter().any(|a| a == f);
+    if has("--h264") {
+        h264_test(args);
+        return true;
+    }
     if !has("--probe") && !has("--demo") {
         return false;
     }
@@ -123,4 +127,59 @@ fn probe(pen: &mut Pen) {
         pump(200);
         let _ = DestroyWindow(hwnd);
     }
+}
+
+// Кодирует живой экран в H.264 (3 секунды) и пишет отчёт в %TEMP%\nerd-h264-test.txt: время, размер, состав потока
+fn h264_test(args: &[String]) {
+    use crate::capture::capture_gdi;
+    use crate::dxgi::Dxgi;
+    use crate::h264::H264;
+    use std::time::Instant;
+    let kbps: u32 = args.iter().position(|a| a == "--kbps").and_then(|i| args.get(i + 1)?.parse().ok()).unwrap_or(6000);
+    let (ow, oh, fps, frames) = (1280, 720, 30u32, 90usize);
+    let dir = std::env::temp_dir();
+    let mut report = format!("цель: {ow}x{oh}, {fps} к/с, {kbps} кбит/с\n");
+    let mon = monitors::rect();
+    let mut gpu = Dxgi::new(mon, || capture_gdi(mon.0, mon.1, mon.2, mon.3, mon.2, mon.3));
+    report += &format!("захват: {}\n", if gpu.is_some() { "видеокарта" } else { "GDI" });
+    let started = Instant::now();
+    let enc = H264::new(ow, oh, fps, kbps);
+    report += &format!("создание кодера: {:.0} мс, {}\n", started.elapsed().as_secs_f32() * 1000.0, if enc.is_some() { "успешно" } else { "НЕ УДАЛОСЬ" });
+    if let Some(mut enc) = enc {
+        let (mut cap_t, mut enc_t, mut stream, mut sizes) = (0.0f32, 0.0f32, Vec::new(), Vec::new());
+        for i in 0..frames {
+            let t0 = Instant::now();
+            let shot = gpu
+                .as_mut()
+                .and_then(|g| g.grab(0, 0, mon.2, mon.3, ow, oh))
+                .or_else(|| capture_gdi(mon.0, mon.1, mon.2, mon.3, ow, oh));
+            cap_t += t0.elapsed().as_secs_f32();
+            let t1 = Instant::now();
+            if let Some(Some(d)) = shot.map(|b| enc.encode(&b, i == 0)) {
+                sizes.push(d.len());
+                stream.extend_from_slice(&d);
+            }
+            enc_t += t1.elapsed().as_secs_f32();
+            std::thread::sleep(Duration::from_millis(1000 / fps as u64).saturating_sub(t0.elapsed()));
+        }
+        let n = sizes.len().max(1) as f32;
+        report += &format!(
+            "кадров получено {} из {frames}; съёмка {:.1} мс, конвертация+кодирование {:.1} мс на кадр\n",
+            sizes.len(), cap_t * 1000.0 / frames as f32, enc_t * 1000.0 / frames as f32
+        );
+        report += &format!(
+            "всего {} КБ, в среднем {:.0} КБ на кадр (первый {} КБ), {:.1} Мбит/с\n",
+            stream.len() / 1024, stream.len() as f32 / n / 1024.0, sizes.first().copied().unwrap_or(0) / 1024,
+            stream.len() as f32 * 8.0 / (frames as f32 / fps as f32) / 1e6
+        );
+        let mut types = std::collections::BTreeMap::new();
+        for w in stream.windows(4) {
+            if w[0] == 0 && w[1] == 0 && w[2] == 1 {
+                *types.entry(w[3] & 0x1f).or_insert(0u32) += 1;
+            }
+        }
+        report += &format!("типы NAL (7 SPS, 8 PPS, 5 ключевой, 1 обычный, 6 SEI, 9 AUD): {types:?}\n");
+        let _ = std::fs::write(dir.join("nerd-h264-test.h264"), &stream);
+    }
+    let _ = std::fs::write(dir.join("nerd-h264-test.txt"), report);
 }

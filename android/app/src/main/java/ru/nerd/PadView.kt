@@ -3,11 +3,15 @@ package ru.nerd
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
+import android.graphics.SurfaceTexture
 import android.os.SystemClock
 import android.view.MotionEvent
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -17,6 +21,7 @@ import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 private const val TAP_SLOP = 24f
 private const val LONG_PRESS_MS = 500L
@@ -44,6 +49,56 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
     private var ox = 0f
     private var oy = 0f
     private var fitScale = 1f
+
+    // Видео H.264 выводится на TextureView под этим видом; здесь рисуются только перо, курсор и подсказки
+    private var videoView: TextureView? = null
+    @Volatile private var surface: Surface? = null
+    private val videoMatrix = Matrix()
+
+    fun attachVideo(view: TextureView) {
+        videoView = view
+        view.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                surface = Surface(st)
+            }
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                surface?.release()
+                surface = null
+                return true
+            }
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+        }
+        view.surfaceTexture?.let { surface = Surface(it) }
+    }
+
+    fun videoSurface(): Surface? = surface
+
+    // Запрос видеопотока (24 байта): область, размер картинки (фиксированный, по размеру экрана), кбит/с и кадров в секунду
+    fun videoRequest(kbps: Int, fps: Int): ByteArray {
+        val x0 = ox.coerceAtLeast(0f)
+        val y0 = oy.coerceAtLeast(0f)
+        val x1 = (ox + width / scale).coerceAtMost(monW)
+        val y1 = (oy + height / scale).coerceAtMost(monH)
+        var ow = width.toFloat()
+        var oh = height.toFloat()
+        val limit = 1920f * 1080f
+        if (ow * oh > limit) {
+            val k = sqrt(limit / (ow * oh))
+            ow *= k
+            oh *= k
+        }
+        val b = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
+        b.putFloat(x0 / monW).putFloat(y0 / monH).putFloat((x1 - x0) / monW).putFloat((y1 - y0) / monH)
+        b.putShort((ow.toInt() and 1.inv()).coerceIn(16, 1920).toShort())
+        b.putShort((oh.toInt() and 1.inv()).coerceIn(16, 1920).toShort())
+        b.putShort(kbps.coerceIn(300, 20000).toShort())
+        b.put(fps.toByte())
+        return b.array()
+    }
+
+    fun onVideoFrame(m: VideoMeta) =
+        onFrame(Frame(null, m.x, m.y, m.w, m.h, m.cursorX, m.cursorY), SystemClock.uptimeMillis() - m.lagMs, m.monW.toFloat(), m.monH.toFloat())
 
     val zoom: Float get() = if (fitScale > 0f) scale / fitScale else 1f
 
@@ -89,7 +144,6 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
     }
 
     init {
-        setBackgroundColor(Color.rgb(14, 15, 19))
         // Пока рисуем, экран не гаснет
         keepScreenOn = true
     }
@@ -150,7 +204,16 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
                 (it.x * monW - ox) * scale, (it.y * monH - oy) * scale,
                 ((it.x + it.w) * monW - ox) * scale, ((it.y + it.h) * monH - oy) * scale,
             )
-            c.drawBitmap(it.bmp, null, dst, bitmapPaint)
+            val bmp = it.bmp
+            if (bmp != null) {
+                videoView?.alpha = 0f
+                c.drawBitmap(bmp, null, dst, bitmapPaint)
+            } else videoView?.let { v ->
+                v.alpha = 1f
+                videoMatrix.setScale(dst.width() / width, dst.height() / height)
+                videoMatrix.postTranslate(dst.left, dst.top)
+                v.setTransform(videoMatrix)
+            }
         }
         frame?.let {
             // В режиме «Мышь» показываем, где сейчас курсор Windows

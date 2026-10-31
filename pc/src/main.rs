@@ -6,6 +6,7 @@ mod devtools;
 mod dialog;
 mod dxgi;
 mod firewall;
+mod h264;
 mod log;
 mod menu;
 mod monitors;

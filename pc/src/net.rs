@@ -2,12 +2,14 @@
 use crate::auth;
 use crate::capture::{capture_gdi, encode_jpeg};
 use crate::dxgi::Dxgi;
+use crate::h264::H264;
 use crate::log;
 use crate::monitors::{self, Rect};
 use crate::pen::{self, Pen};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PORT: u16 = 47800;
@@ -139,6 +141,12 @@ fn serve_client(mut s: TcpStream) -> std::io::Result<()> {
                 crate::settings::save(&crate::settings::Settings { monitor: monitors::selected() });
                 continue;
             }
+            2 => {
+                // Устройство просит видеопоток: дальше кадры шлёт ПК сам
+                s.read_exact(&mut req)?;
+                drop(gpu);
+                return serve_video(s, parse_video(&req));
+            }
             _ => return Ok(()),
         }
         s.read_exact(&mut req)?;
@@ -199,6 +207,164 @@ fn serve_client(mut s: TcpStream) -> std::io::Result<()> {
         s.write_all(&head)?;
         s.write_all(&jpeg)?;
     }
+}
+
+// Запрос видеопотока (24 байта): x f32, y f32, w f32, h f32 (доли монитора) | ширина u16, высота u16 |
+// кбит/с u16 | кадров в секунду u8 | 1 байт. Присылается снова при каждой смене области или настроек.
+// Тип 3 от устройства: метка времени u32, ПК возвращает её в каждом кадре, по ней устройство считает задержку.
+// Кадр потока: x, y, w, h f32 | mon_w u16, mon_h u16 | len u32 | курсор x f32, y f32 | номер кадра u32 |
+// ширина u16, высота u16 | метка времени u32 | H.264
+#[derive(Clone, Copy, PartialEq)]
+struct Video {
+    region: [f32; 4],
+    ow: i32,
+    oh: i32,
+    kbps: u32,
+    fps: u32,
+}
+
+fn parse_video(req: &[u8; 24]) -> Video {
+    let f = |i: usize| f32::from_le_bytes(req[i..i + 4].try_into().unwrap());
+    let (rx, ry) = (f(0).clamp(0.0, 1.0), f(4).clamp(0.0, 1.0));
+    Video {
+        region: [rx, ry, f(8).clamp(0.0, 1.0 - rx), f(12).clamp(0.0, 1.0 - ry)],
+        ow: ((u16::from_le_bytes([req[16], req[17]]) as i32) & !1).clamp(16, 1920),
+        oh: ((u16::from_le_bytes([req[18], req[19]]) as i32) & !1).clamp(16, 1920),
+        kbps: (u16::from_le_bytes([req[20], req[21]]) as u32).clamp(300, 20000),
+        fps: (req[22] as u32).clamp(10, 60),
+    }
+}
+
+fn serve_video(mut s: TcpStream, first: Video) -> std::io::Result<()> {
+    let shared = Arc::new(Mutex::new(first));
+    let alive = Arc::new(AtomicBool::new(true));
+    let echo = Arc::new(AtomicU32::new(0));
+    let mut reader = s.try_clone()?;
+    {
+        let (shared, alive, echo) = (shared.clone(), alive.clone(), echo.clone());
+        std::thread::spawn(move || {
+            let mut req = [0u8; 24];
+            loop {
+                let mut kind = [0u8; 1];
+                if reader.read_exact(&mut kind).is_err() {
+                    break;
+                }
+                let ok = match kind[0] {
+                    0 => reader.read_exact(&mut req).is_ok(),
+                    1 => {
+                        let mut n = [0u8; 1];
+                        let ok = reader.read_exact(&mut n).is_ok();
+                        if ok {
+                            monitors::select(Some(n[0] as u32));
+                            crate::settings::save(&crate::settings::Settings { monitor: monitors::selected() });
+                        }
+                        ok
+                    }
+                    2 => {
+                        let ok = reader.read_exact(&mut req).is_ok();
+                        if ok {
+                            *shared.lock().unwrap() = parse_video(&req);
+                        }
+                        ok
+                    }
+                    3 => {
+                        let mut t = [0u8; 4];
+                        let ok = reader.read_exact(&mut t).is_ok();
+                        if ok {
+                            echo.store(u32::from_le_bytes(t), Ordering::SeqCst);
+                        }
+                        ok
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    break;
+                }
+            }
+            alive.store(false, Ordering::SeqCst);
+        });
+    }
+
+    let mut generation = monitors::generation();
+    let mut gpu = Dxgi::new(monitors::rect(), seed(monitors::rect()));
+    let mut enc: Option<(H264, Video)> = None;
+    let (mut seq, mut frames, mut bytes) = (0u32, 0u32, 0usize);
+    let mut spent = Duration::ZERO;
+    let mut since = Instant::now();
+    log!("видеопоток H.264, захват: {}", if gpu.is_some() { "видеокарта (DXGI)" } else { "GDI" });
+    while alive.load(Ordering::SeqCst) {
+        let t0 = Instant::now();
+        let v = *shared.lock().unwrap();
+        // кодер пересоздаётся при смене размера, битрейта или частоты кадров
+        let same = enc.as_ref().is_some_and(|(_, c)| (c.ow, c.oh, c.kbps, c.fps) == (v.ow, v.oh, v.kbps, v.fps));
+        if !same {
+            match H264::new(v.ow, v.oh, v.fps, v.kbps) {
+                Some(e) => enc = Some((e, v)),
+                None => {
+                    log!("видеопоток: кодер H.264 не создан, устройство перейдёт на JPEG");
+                    return Ok(());
+                }
+            }
+            log!("кодер: {}x{}, {} к/с, {} кбит/с", v.ow, v.oh, v.fps, v.kbps);
+        }
+        if generation != monitors::generation() {
+            generation = monitors::generation();
+            gpu = Dxgi::new(monitors::rect(), seed(monitors::rect()));
+        }
+        let mon = monitors::rect();
+        let (x0, y0, w, h) = mon;
+        let [rx, ry, rw, rh] = v.region;
+        let sx = x0 + (rx * w as f32) as i32;
+        let sy = y0 + (ry * h as f32) as i32;
+        let sw = ((rw * w as f32) as i32).max(1);
+        let sh = ((rh * h as f32) as i32).max(1);
+        let shot = match gpu.as_mut().map(|g| g.grab(sx - x0, sy - y0, sw, sh, v.ow, v.oh)) {
+            Some(Some(buf)) => Some(buf),
+            Some(None) => {
+                gpu = Dxgi::new(mon, seed(mon));
+                capture_gdi(sx, sy, sw, sh, v.ow, v.oh)
+            }
+            None => capture_gdi(sx, sy, sw, sh, v.ow, v.oh),
+        };
+        let key = seq == 0;
+        let Some(data) = shot.and_then(|buf| enc.as_mut()?.0.encode(&buf, key)) else {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        let mut head = Vec::with_capacity(44);
+        for x in v.region {
+            head.extend_from_slice(&x.to_le_bytes());
+        }
+        head.extend_from_slice(&(w as u16).to_le_bytes());
+        head.extend_from_slice(&(h as u16).to_le_bytes());
+        head.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        let (cx, cy) = cursor_fraction(mon);
+        head.extend_from_slice(&cx.to_le_bytes());
+        head.extend_from_slice(&cy.to_le_bytes());
+        head.extend_from_slice(&seq.to_le_bytes());
+        head.extend_from_slice(&(v.ow as u16).to_le_bytes());
+        head.extend_from_slice(&(v.oh as u16).to_le_bytes());
+        head.extend_from_slice(&echo.load(Ordering::SeqCst).to_le_bytes());
+        s.write_all(&head)?;
+        s.write_all(&data)?;
+        seq = seq.wrapping_add(1);
+        frames += 1;
+        bytes += data.len();
+        spent += t0.elapsed();
+        if since.elapsed() >= Duration::from_secs(3) {
+            log!(
+                "видео: {:.0} к/с, {:.1} мс на кадр, {} КБ/кадр, {:.1} Мбит/с",
+                frames as f32 / since.elapsed().as_secs_f32(),
+                spent.as_secs_f32() * 1000.0 / frames as f32,
+                bytes / frames as usize / 1024,
+                bytes as f32 * 8.0 / since.elapsed().as_secs_f32() / 1e6
+            );
+            (frames, bytes, spent, since) = (0, 0, Duration::ZERO, Instant::now());
+        }
+        let interval = Duration::from_micros(1_000_000 / v.fps as u64);
+        std::thread::sleep(interval.saturating_sub(t0.elapsed()));
+    }
+    Ok(())
 }
 
 pub fn serve_screen() {

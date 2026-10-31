@@ -55,6 +55,7 @@ import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -217,6 +218,7 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val sender = remember { Sender(host) }
     val pad = remember { PadView(context, sender) }
+    val video = remember { android.view.TextureView(context).also { pad.attachVideo(it) } }
     val client = remember { ScreenClient(context, host, pad, sender, identity) }
     DisposableEffect(Unit) { onDispose { client.stop() } }
     BackHandler(onBack = onExit)
@@ -254,7 +256,8 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    Box(modifier = Modifier.fillMaxSize().background(Color(0xFF0E0F13))) {
+        AndroidView(factory = { video }, modifier = Modifier.fillMaxSize())
         AndroidView(factory = { pad }, modifier = Modifier.fillMaxSize())
 
         if (state != ConnState.CONNECTED) {
@@ -414,6 +417,7 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
             val prefs = remember { context.getSharedPreferences("nerd", android.content.Context.MODE_PRIVATE) }
             var quality by remember { mutableStateOf(AppSettings.quality) }
             var pressure by remember { mutableStateOf(AppSettings.fingerPressure) }
+            var useVideo by remember { mutableStateOf(AppSettings.video) }
             AlertDialog(
                 onDismissRequest = { showSettings = false },
                 title = { Text("Настройки") },
@@ -431,6 +435,10 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
                             onValueChange = { pressure = it; AppSettings.fingerPressure = it },
                             valueRange = 0.1f..1f,
                         )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Видео H.264 (меньше трафика и задержки). Применится при следующем подключении.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                            Switch(checked = useVideo, onCheckedChange = { useVideo = it; AppSettings.video = it })
+                        }
                     }
                 },
                 confirmButton = {

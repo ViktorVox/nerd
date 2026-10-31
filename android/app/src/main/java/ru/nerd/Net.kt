@@ -28,14 +28,16 @@ internal const val DISCOVERY_PORT = 47802
 object AppSettings {
     @Volatile var quality = 60
     @Volatile var fingerPressure = 0.6f
+    @Volatile var video = true
 
     fun load(prefs: android.content.SharedPreferences) {
         quality = prefs.getInt("quality", 60)
         fingerPressure = prefs.getFloat("finger_pressure", 0.6f)
+        video = prefs.getBoolean("video", true)
     }
 
     fun save(prefs: android.content.SharedPreferences) {
-        prefs.edit().putInt("quality", quality).putFloat("finger_pressure", fingerPressure).apply()
+        prefs.edit().putInt("quality", quality).putFloat("finger_pressure", fingerPressure).putBoolean("video", video).apply()
     }
 }
 
@@ -115,7 +117,7 @@ class Sender(host: String) {
 
 // Кадр экрана ПК и область монитора (доли 0..1), которую он показывает
 class Frame(
-    val bmp: Bitmap,
+    val bmp: Bitmap?,
     val x: Float,
     val y: Float,
     val w: Float,
@@ -168,6 +170,7 @@ class ScreenClient(
     @Volatile var problem = ""
         private set
     @Volatile private var wantMonitor = -1
+    @Volatile private var videoFailed = false
 
     // Без этого Wi-Fi уходит в энергосбережение и добавляет к задержке десятки миллисекунд
     private val wifiLock = runCatching {
@@ -190,6 +193,93 @@ class ScreenClient(
     fun selectMonitor(num: Int) {
         currentMonitor = num
         wantMonitor = num
+    }
+
+    private fun surfaceReady(): Boolean {
+        val end = SystemClock.uptimeMillis() + 1500
+        while (running && SystemClock.uptimeMillis() < end) {
+            if (pad.videoSurface() != null) return true
+            Thread.sleep(50)
+        }
+        return false
+    }
+
+    // Видео H.264: устройство присылает область и настройки, ПК сам шлёт кадры. Если кадров не пришло ни одного
+    // (старая версия на ПК или кодер не запустился), дальше работаем картинками JPEG
+    private fun videoLoop(input: DataInputStream, out: java.io.OutputStream) {
+        val surface = pad.videoSurface() ?: return
+        var decoder: VideoDecoder? = null
+        var gotFrame = false
+        val writer = Thread {
+            try {
+                var last = ByteArray(0)
+                var lastPing = 0L
+                while (running) {
+                    val m = wantMonitor
+                    if (m >= 0) {
+                        wantMonitor = -1
+                        out.write(byteArrayOf(1, m.toByte()))
+                    }
+                    val req = pad.videoRequest(AppSettings.quality * 100, 30)
+                    if (!req.contentEquals(last)) {
+                        out.write(byteArrayOf(2) + req)
+                        last = req
+                    }
+                    val now = SystemClock.uptimeMillis()
+                    if (now - lastPing >= 100) {
+                        lastPing = now
+                        out.write(byteArrayOf(3) + ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(now.toInt()).array())
+                    }
+                    out.flush()
+                    Thread.sleep(25)
+                }
+            } catch (e: Exception) {
+                // связь закрыта или поток прерван
+            }
+        }.apply { isDaemon = true; start() }
+        try {
+            val head = ByteArray(44)
+            var frames = 0
+            var bytes = 0L
+            var lagSum = 0L
+            var since = SystemClock.uptimeMillis()
+            while (running) {
+                input.readFully(head)
+                val b = ByteBuffer.wrap(head).order(ByteOrder.LITTLE_ENDIAN)
+                val x = b.float; val y = b.float; val w = b.float; val h = b.float
+                val monW = b.short.toInt() and 0xFFFF
+                val monH = b.short.toInt() and 0xFFFF
+                val len = b.int
+                val cursorX = b.float; val cursorY = b.float
+                val seq = b.int.toLong() and 0xFFFFFFFFL
+                val ow = b.short.toInt() and 0xFFFF
+                val oh = b.short.toInt() and 0xFFFF
+                val echo = b.int
+                if (len <= 0 || len > 20_000_000) break
+                val data = ByteArray(len)
+                input.readFully(data)
+                gotFrame = true
+                val now = SystemClock.uptimeMillis()
+                val lag = (now.toInt() - echo).toLong().coerceIn(0L, 2000L)
+                var d = decoder
+                if (d == null || d.width != ow || d.height != oh) {
+                    d?.stop()
+                    d = VideoDecoder(surface, ow, oh) { pad.onVideoFrame(it) }
+                    decoder = d
+                }
+                if (!d.feed(data, seq, VideoMeta(x, y, w, h, cursorX, cursorY, monW, monH, lag))) break
+
+                frames++; bytes += len; lagSum += lag
+                if (now - since >= 1000) {
+                    statsText = "H.264 · ${frames * 1000 / (now - since)} к/с · ${lagSum / frames} мс · ${"%.1f".format(bytes * 8.0 / (now - since) / 1000)} Мбит/с"
+                    frames = 0; bytes = 0; lagSum = 0; since = now
+                }
+            }
+        } finally {
+            writer.interrupt()
+            decoder?.stop()
+            if (!gotFrame) videoFailed = true
+        }
     }
 
     private fun inLocalNet(): Boolean = runCatching {
@@ -263,6 +353,13 @@ class ScreenClient(
                 s.soTimeout = 0
                 stage = 2
                 problem = ""
+
+                if (AppSettings.video && !videoFailed && surfaceReady()) {
+                    state = ConnState.CONNECTED
+                    videoLoop(input, out)
+                    if (running) Thread.sleep(300)
+                    continue
+                }
 
                 val sentAt = ConcurrentLinkedQueue<Long>()
                 val slots = Semaphore(IN_FLIGHT)
