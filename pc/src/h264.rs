@@ -1,6 +1,7 @@
 // Кодирование кадров в H.264 средствами Windows (Media Foundation, кодер Microsoft без задержки на буферизацию)
 use crate::log;
 use std::mem::ManuallyDrop;
+use std::time::{Duration, Instant};
 use windows::core::{Interface, GUID};
 use windows::Win32::Foundation::VARIANT_BOOL;
 use windows::Win32::Media::MediaFoundation::*;
@@ -35,6 +36,8 @@ fn chk<T>(r: windows::core::Result<T>, what: &str) -> Option<T> {
 
 pub struct H264 {
     mft: IMFTransform,
+    // Есть только у кодера видеокарты: он асинхронный и сообщает о готовности событиями
+    events: Option<IMFMediaEventGenerator>,
     codec: Option<ICodecAPI>,
     w: usize,
     h: usize,
@@ -43,40 +46,53 @@ pub struct H264 {
     // Размер выходного буфера, если кодер сам кадры не выдаёт
     out_size: Option<u32>,
     nv12: Vec<u8>,
+    need_input: u32,
+    pending: Vec<u8>,
+    pub name: String,
 }
 
 impl H264 {
-    pub fn new(w: i32, h: i32, fps: u32, kbps: u32) -> Option<Self> {
+    // hardware: true - кодер видеокарты (NVENC, Quick Sync, AMD), false - программный кодер Microsoft
+    pub fn new(w: i32, h: i32, fps: u32, kbps: u32, hardware: bool) -> Option<Self> {
         let (w, h) = ((w & !1).max(16) as usize, (h & !1).max(16) as usize);
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             chk(MFStartup(MF_VERSION, MFSTARTUP_FULL), "запуск Media Foundation")?;
             let tin = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
             let tout = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
+            let flags = if hardware { MFT_ENUM_FLAG_HARDWARE } else { MFT_ENUM_FLAG_SYNCMFT } | MFT_ENUM_FLAG_SORTANDFILTER;
             let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
             let mut count = 0u32;
-            chk(
-                MFTEnumEx(
-                    MFT_CATEGORY_VIDEO_ENCODER,
-                    MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
-                    Some(&tin),
-                    Some(&tout),
-                    &mut list,
-                    &mut count,
-                ),
-                "поиск кодера",
-            )?;
+            chk(MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, Some(&tin), Some(&tout), &mut list, &mut count), "поиск кодера")?;
             if list.is_null() || count == 0 {
-                log!("H.264: кодер Windows не найден");
+                log!("H.264: {} кодер не найден", if hardware { "аппаратный" } else { "программный" });
                 return None;
             }
             let acts = std::slice::from_raw_parts_mut(list, count as usize);
-            let mft = acts.iter().flatten().find_map(|a| a.ActivateObject::<IMFTransform>().ok());
+            let mut found: Option<(IMFTransform, String)> = None;
+            for a in acts.iter().flatten() {
+                let mut buf = [0u16; 128];
+                let _ = a.GetString(&MFT_FRIENDLY_NAME_Attribute, &mut buf, None);
+                let name = String::from_utf16_lossy(&buf).trim_end_matches('\0').to_string();
+                if let Ok(m) = a.ActivateObject::<IMFTransform>() {
+                    found = Some((m, name));
+                    break;
+                }
+            }
             for a in acts.iter_mut() {
                 a.take();
             }
             CoTaskMemFree(Some(list as *const _));
-            let mft = mft?;
+            let (mft, name) = found?;
+
+            let events = if hardware {
+                let attrs = chk(mft.GetAttributes(), "атрибуты кодера")?;
+                chk(attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1), "разблокировка асинхронного кодера")?;
+                let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+                Some(chk(mft.cast::<IMFMediaEventGenerator>(), "события кодера")?)
+            } else {
+                None
+            };
 
             let codec = mft.cast::<ICodecAPI>().ok();
             if let Some(c) = &codec {
@@ -86,11 +102,14 @@ impl H264 {
                     }
                 };
                 set(&CODECAPI_AVLowLatencyMode, var_bool(true));
+                set(&CODECAPI_AVEncCommonRealTime, var_bool(true));
                 set(&CODECAPI_AVEncCommonRateControlMode, var_u32(0));
                 set(&CODECAPI_AVEncCommonMeanBitRate, var_u32(kbps * 1000));
                 set(&CODECAPI_AVEncMPVGOPSize, var_u32(fps * 10));
                 set(&CODECAPI_AVEncMPVDefaultBPictureCount, var_u32(0));
-                set(&CODECAPI_AVEncCommonQualityVsSpeed, var_u32(30));
+                if !hardware {
+                    set(&CODECAPI_AVEncCommonQualityVsSpeed, var_u32(30));
+                }
             }
 
             let video = |sub: &GUID| -> windows::core::Result<IMFMediaType> {
@@ -103,7 +122,7 @@ impl H264 {
                 t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
                 Ok(t)
             };
-            // Кодеру Microsoft сначала нужен выходной тип, потом входной
+            // Сначала выходной тип, потом входной
             let out = chk(video(&MFVideoFormat_H264), "тип H.264")?;
             chk(out.SetUINT32(&MF_MT_AVG_BITRATE, kbps * 1000), "битрейт")?;
             chk(out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32), "профиль")?;
@@ -116,6 +135,7 @@ impl H264 {
             let out_size = (info.dwFlags & 0x100 == 0).then(|| info.cbSize.max(1 << 20));
             Some(H264 {
                 mft,
+                events,
                 codec,
                 w,
                 h,
@@ -123,8 +143,15 @@ impl H264 {
                 pts: 0,
                 out_size,
                 nv12: Vec::new(),
+                need_input: 0,
+                pending: Vec::new(),
+                name,
             })
         }
+    }
+
+    pub fn hardware(&self) -> bool {
+        self.events.is_some()
     }
 
     // bgra - кадр w x h. Возвращает поток H.264 (Annex B); None - кадр не получился
@@ -152,46 +179,113 @@ impl H264 {
                     let _ = c.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
                 }
             }
-            chk(self.mft.ProcessInput(0, &sample, 0), "подача кадра")?;
-
-            let mut data = Vec::new();
-            loop {
-                let out_sample = match self.out_size {
-                    Some(size) => {
-                        let s = chk(MFCreateSample(), "образец выхода")?;
-                        let b = chk(MFCreateMemoryBuffer(size), "буфер выхода")?;
-                        chk(s.AddBuffer(&b), "добавление буфера выхода")?;
-                        Some(s)
-                    }
-                    None => None,
-                };
-                let mut out = [MFT_OUTPUT_DATA_BUFFER {
-                    dwStreamID: 0,
-                    pSample: ManuallyDrop::new(out_sample),
-                    dwStatus: 0,
-                    pEvents: ManuallyDrop::new(None),
-                }];
-                let mut status = 0u32;
-                let r = self.mft.ProcessOutput(0, &mut out, &mut status);
-                let got = ManuallyDrop::take(&mut out[0].pSample);
-                ManuallyDrop::drop(&mut out[0].pEvents);
-                match r {
-                    Ok(()) => {
-                        let Some(s) = got else { break };
-                        let b = chk(s.ConvertToContiguousBuffer(), "чтение кадра")?;
-                        let (mut q, mut n) = (std::ptr::null_mut(), 0u32);
-                        chk(b.Lock(&mut q, None, Some(&mut n)), "доступ к выходу")?;
-                        data.extend_from_slice(std::slice::from_raw_parts(q, n as usize));
-                        chk(b.Unlock(), "освобождение выхода")?;
-                    }
-                    Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
-                    Err(e) => {
-                        log!("H.264: выдача кадра: {e}");
-                        return None;
+            if self.events.is_some() {
+                self.encode_async(&sample)
+            } else {
+                chk(self.mft.ProcessInput(0, &sample, 0), "подача кадра")?;
+                let mut data = Vec::new();
+                loop {
+                    match self.pull() {
+                        Ok(Some(d)) => data.extend_from_slice(&d),
+                        Ok(None) => break,
+                        Err(e) => {
+                            log!("H.264: выдача кадра: {e}");
+                            return None;
+                        }
                     }
                 }
+                (!data.is_empty()).then_some(data)
             }
-            (!data.is_empty()).then_some(data)
+        }
+    }
+
+    // Кодер видеокарты: ждём события «готов принять кадр» и «кадр готов»; не дольше 300 мс
+    unsafe fn encode_async(&mut self, sample: &IMFSample) -> Option<Vec<u8>> {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while self.need_input == 0 {
+            if !self.wait_event(deadline)? {
+                log!("H.264: кодер видеокарты не готов принять кадр");
+                return None;
+            }
+        }
+        chk(self.mft.ProcessInput(0, sample, 0), "подача кадра")?;
+        self.need_input -= 1;
+        while self.pending.is_empty() {
+            if !self.wait_event(deadline)? {
+                log!("H.264: кодер видеокарты не выдал кадр");
+                return None;
+            }
+        }
+        Some(std::mem::take(&mut self.pending))
+    }
+
+    // Some(true) - событие разобрано, Some(false) - время вышло, None - ошибка
+    unsafe fn wait_event(&mut self, deadline: Instant) -> Option<bool> {
+        let events = self.events.clone()?;
+        loop {
+            match events.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+                Ok(ev) => {
+                    let ty = chk(ev.GetType(), "тип события")?;
+                    if ty == METransformNeedInput.0 as u32 {
+                        self.need_input += 1;
+                    } else if ty == METransformHaveOutput.0 as u32 {
+                        match self.pull() {
+                            Ok(Some(d)) => self.pending.extend_from_slice(&d),
+                            Ok(None) => {}
+                            Err(e) => {
+                                log!("H.264: выдача кадра: {e}");
+                                return None;
+                            }
+                        }
+                    }
+                    return Some(true);
+                }
+                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                    if Instant::now() >= deadline {
+                        return Some(false);
+                    }
+                    std::thread::sleep(Duration::from_micros(500));
+                }
+                Err(e) => {
+                    log!("H.264: события кодера: {e}");
+                    return None;
+                }
+            }
+        }
+    }
+
+    // Один вызов ProcessOutput: Some - готовые данные, None - кодеру нужен следующий кадр
+    unsafe fn pull(&mut self) -> windows::core::Result<Option<Vec<u8>>> {
+        let out_sample = match self.out_size {
+            Some(size) => {
+                let s = MFCreateSample()?;
+                s.AddBuffer(&MFCreateMemoryBuffer(size)?)?;
+                Some(s)
+            }
+            None => None,
+        };
+        let mut out = [MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            pSample: ManuallyDrop::new(out_sample),
+            dwStatus: 0,
+            pEvents: ManuallyDrop::new(None),
+        }];
+        let mut status = 0u32;
+        let r = self.mft.ProcessOutput(0, &mut out, &mut status);
+        let got = ManuallyDrop::take(&mut out[0].pSample);
+        ManuallyDrop::drop(&mut out[0].pEvents);
+        match r {
+            Ok(()) => {
+                let Some(s) = got else { return Ok(None) };
+                let b = s.ConvertToContiguousBuffer()?;
+                let (mut q, mut n) = (std::ptr::null_mut(), 0u32);
+                b.Lock(&mut q, None, Some(&mut n))?;
+                let data = std::slice::from_raw_parts(q, n as usize).to_vec();
+                b.Unlock()?;
+                Ok(Some(data))
+            }
+            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(None),
+            Err(e) => Err(e),
         }
     }
 }

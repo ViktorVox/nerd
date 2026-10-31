@@ -143,8 +143,13 @@ fn h264_test(args: &[String]) {
     let mut gpu = Dxgi::new(mon, || capture_gdi(mon.0, mon.1, mon.2, mon.3, mon.2, mon.3));
     report += &format!("захват: {}\n", if gpu.is_some() { "видеокарта" } else { "GDI" });
     let started = Instant::now();
-    let enc = H264::new(ow, oh, fps, kbps);
-    report += &format!("создание кодера: {:.0} мс, {}\n", started.elapsed().as_secs_f32() * 1000.0, if enc.is_some() { "успешно" } else { "НЕ УДАЛОСЬ" });
+    let soft = args.iter().any(|a| a == "--soft");
+    let enc = H264::new(ow, oh, fps, kbps, !soft);
+    report += &format!(
+        "создание кодера: {:.0} мс, {}\n",
+        started.elapsed().as_secs_f32() * 1000.0,
+        enc.as_ref().map_or("НЕ УДАЛОСЬ".to_string(), |e| format!("{} ({})", e.name, if e.hardware() { "видеокарта" } else { "процессор" }))
+    );
     if let Some(mut enc) = enc {
         let (mut cap_t, mut enc_t, mut stream, mut sizes) = (0.0f32, 0.0f32, Vec::new(), Vec::new());
         for i in 0..frames {

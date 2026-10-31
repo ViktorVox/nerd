@@ -288,6 +288,7 @@ fn serve_video(mut s: TcpStream, first: Video) -> std::io::Result<()> {
     let mut generation = monitors::generation();
     let mut gpu = Dxgi::new(monitors::rect(), seed(monitors::rect()));
     let mut enc: Option<(H264, Video)> = None;
+    let (mut hardware_ok, mut fails) = (true, 0u32);
     let (mut seq, mut frames, mut bytes) = (0u32, 0u32, 0usize);
     let mut spent = Duration::ZERO;
     let mut since = Instant::now();
@@ -295,17 +296,30 @@ fn serve_video(mut s: TcpStream, first: Video) -> std::io::Result<()> {
     while alive.load(Ordering::SeqCst) {
         let t0 = Instant::now();
         let v = *shared.lock().unwrap();
-        // кодер пересоздаётся при смене размера, битрейта или частоты кадров
-        let same = enc.as_ref().is_some_and(|(_, c)| (c.ow, c.oh, c.kbps, c.fps) == (v.ow, v.oh, v.kbps, v.fps));
+        // кодер пересоздаётся при смене размера, битрейта или частоты кадров; программному больше 30 к/с не по силам
+        let same = enc.as_ref().is_some_and(|(e, c)| {
+            (c.ow, c.oh, c.kbps, c.fps) == (v.ow, v.oh, v.kbps, if e.hardware() { v.fps } else { v.fps.min(30) })
+        });
         if !same {
-            match H264::new(v.ow, v.oh, v.fps, v.kbps) {
-                Some(e) => enc = Some((e, v)),
-                None => {
-                    log!("видеопоток: кодер H.264 не создан, устройство перейдёт на JPEG");
-                    return Ok(());
-                }
-            }
-            log!("кодер: {}x{}, {} к/с, {} кбит/с", v.ow, v.oh, v.fps, v.kbps);
+            let hard = if hardware_ok { H264::new(v.ow, v.oh, v.fps, v.kbps, true).map(|e| (e, v)) } else { None };
+            let soft = || {
+                let c = Video { fps: v.fps.min(30), ..v };
+                H264::new(c.ow, c.oh, c.fps, c.kbps, false).map(|e| (e, c))
+            };
+            let Some(built) = hard.or_else(soft) else {
+                log!("видеопоток: кодер H.264 не создан, устройство перейдёт на JPEG");
+                return Ok(());
+            };
+            log!(
+                "кодер: {} ({}), {}x{}, {} к/с, {} кбит/с",
+                built.0.name,
+                if built.0.hardware() { "видеокарта" } else { "процессор" },
+                built.1.ow,
+                built.1.oh,
+                built.1.fps,
+                built.1.kbps
+            );
+            enc = Some(built);
         }
         if generation != monitors::generation() {
             generation = monitors::generation();
@@ -327,10 +341,23 @@ fn serve_video(mut s: TcpStream, first: Video) -> std::io::Result<()> {
             None => capture_gdi(sx, sy, sw, sh, v.ow, v.oh),
         };
         let key = seq == 0;
-        let Some(data) = shot.and_then(|buf| enc.as_mut()?.0.encode(&buf, key)) else {
+        let Some(buf) = shot else {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         };
+        let Some(data) = enc.as_mut().and_then(|(e, _)| e.encode(&buf, key)) else {
+            fails += 1;
+            // кодер видеокарты не справляется: дальше работаем программным
+            if fails >= 30 && enc.as_ref().is_some_and(|(e, _)| e.hardware()) {
+                log!("видеопоток: кодер видеокарты не выдаёт кадры, переходим на процессор");
+                hardware_ok = false;
+                enc = None;
+                fails = 0;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        fails = 0;
         let mut head = Vec::with_capacity(44);
         for x in v.region {
             head.extend_from_slice(&x.to_le_bytes());
@@ -361,7 +388,8 @@ fn serve_video(mut s: TcpStream, first: Video) -> std::io::Result<()> {
             );
             (frames, bytes, spent, since) = (0, 0, Duration::ZERO, Instant::now());
         }
-        let interval = Duration::from_micros(1_000_000 / v.fps as u64);
+        let fps = enc.as_ref().map_or(v.fps, |(_, c)| c.fps);
+        let interval = Duration::from_micros(1_000_000 / fps as u64);
         std::thread::sleep(interval.saturating_sub(t0.elapsed()));
     }
     Ok(())

@@ -224,7 +224,7 @@ class ScreenClient(
                         wantMonitor = -1
                         out.write(byteArrayOf(1, m.toByte()))
                     }
-                    val req = pad.videoRequest(AppSettings.quality * 100, 30)
+                    val req = pad.videoRequest(AppSettings.quality * 100, 60)
                     if (!req.contentEquals(last)) {
                         out.write(byteArrayOf(2) + req)
                         last = req
