@@ -265,6 +265,13 @@ private fun PadScreen(host: String, identity: Identity, onExit: () -> Unit) {
             panelsVisible = false
         }
     }
+    // Пока по экрану что-то происходит, панели не скрываются; касание экрана возвращает скрытые панели
+    DisposableEffect(Unit) {
+        pad.onActivity = { press ->
+            if (press && !panelsVisible) panelsVisible = true else panelTouches++
+        }
+        onDispose { pad.onActivity = null }
+    }
     var ctrl by remember { mutableStateOf(false) }
     var shift by remember { mutableStateOf(false) }
     var spaceDown by remember { mutableStateOf(false) }

@@ -155,6 +155,21 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
     private val tapY = FloatArray(10)
 
     private var penDown = false
+
+    // Палец лежит на экране в режиме «Мышь»: курсор рисуем сразу под ним, не дожидаясь кадра от ПК
+    private var mouseTouching = false
+
+    // Любая активность на экране (press: касание началось) - по ней панели не скрываются и возвращаются
+    var onActivity: ((Boolean) -> Unit)? = null
+    private var activityAt = 0L
+
+    private fun reportActivity() {
+        val now = SystemClock.uptimeMillis()
+        if (now - activityAt >= 400) {
+            activityAt = now
+            onActivity?.invoke(false)
+        }
+    }
     private var lastX = 0f
     private var lastY = 0f
     private var downTime = 0L
@@ -247,12 +262,15 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
                 c.drawBitmap(bmp, null, dst, bitmapPaint)
             } else applyVideoTransform()
         }
-        frame?.let {
-            // В режиме «Мышь» показываем, где сейчас курсор Windows
-            if (mode == Mode.MOUSE && it.cursorX >= 0f) {
+        if (mode == Mode.MOUSE) {
+            // Пока палец на экране, курсор под ним; иначе там, где его сообщил ПК
+            val f = frame
+            val remote = f != null && f.cursorX >= 0f
+            if (mouseTouching || remote) {
                 val k = resources.displayMetrics.density * 1.1f
                 c.save()
-                c.translate((it.cursorX * monW - ox) * scale, (it.cursorY * monH - oy) * scale)
+                if (mouseTouching) c.translate(lastX, lastY)
+                else c.translate((f!!.cursorX * monW - ox) * scale, (f.cursorY * monH - oy) * scale)
                 c.scale(k, k)
                 c.drawPath(cursorPath, cursorFill)
                 c.drawPath(cursorPath, cursorLine)
@@ -310,7 +328,11 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
                 addInk(e.x, e.y, true)
                 penDown = true
             }
-            Mode.MOUSE -> sender.mouseMove(nx(e.x), ny(e.y))
+            Mode.MOUSE -> {
+                mouseTouching = true
+                sender.mouseMove(nx(e.x), ny(e.y))
+                invalidate()
+            }
         }
     }
 
@@ -327,12 +349,17 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
                 addInk(e.x, e.y, false)
                 invalidate()
             }
-            Mode.MOUSE -> sender.mouseMove(nx(e.x), ny(e.y))
+            Mode.MOUSE -> {
+                sender.mouseMove(nx(e.x), ny(e.y))
+                invalidate()
+            }
         }
     }
 
     // up = true: палец отпущен; false: отменён вторым пальцем (клик не нужен)
     private fun fingerEnd(e: MotionEvent?, up: Boolean) {
+        mouseTouching = false
+        invalidate()
         when (mode) {
             Mode.DRAW -> if (penDown) {
                 pen(UP, lastX, lastY, 0f)
@@ -396,7 +423,12 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
         // События касаний приходят сразу, а не пачкой раз в кадр: перо и палец отзываются на несколько миллисекунд раньше
-        if (e.actionMasked == MotionEvent.ACTION_DOWN) requestUnbufferedDispatch(e)
+        if (e.actionMasked == MotionEvent.ACTION_DOWN) {
+            requestUnbufferedDispatch(e)
+            onActivity?.invoke(true)
+        } else if (e.actionMasked == MotionEvent.ACTION_MOVE) {
+            reportActivity()
+        }
         if (e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS) return stylus(e)
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -440,5 +472,10 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
     }
 
     override fun onGenericMotionEvent(e: MotionEvent): Boolean =
-        if (e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS) stylus(e) else false
+        if (e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS) {
+            reportActivity()
+            stylus(e)
+        } else {
+            false
+        }
 }
