@@ -30,6 +30,9 @@ private const val LONG_PRESS_MS = 500L
 private const val INK_MARGIN_MS = 80L
 private const val INK_MAX_AGE_MS = 3000L
 
+// Область видеозапроса меняется, только когда вид замер на это время
+private const val REGION_SETTLE_MS = 250L
+
 enum class Mode(val title: String) { DRAW("Рисовать"), MOUSE("Мышь") }
 
 // Точка локальной линии в координатах монитора; start = начало нового штриха
@@ -75,6 +78,22 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
     fun videoSurface(): Surface? = surface
 
     // Запрос видеопотока (24 байта): область, размер картинки (фиксированный, по размеру экрана), кбит/с и кадров в секунду
+    private var wantRegion = FloatArray(4)
+    private var wantAt = 0L
+    private var sentRegion: FloatArray? = null
+
+    // Пока вид двигают и масштабируют, ПК продолжает слать прежнюю область, а картинка перемещается здесь, на устройстве.
+    // Новая, чёткая область запрашивается, когда движение закончилось
+    private fun stableRegion(r: FloatArray): FloatArray {
+        val now = SystemClock.uptimeMillis()
+        if (!wantRegion.contentEquals(r)) {
+            wantRegion = r
+            wantAt = now
+        }
+        if (sentRegion == null || now - wantAt >= REGION_SETTLE_MS) sentRegion = wantRegion
+        return sentRegion!!
+    }
+
     fun videoRequest(kbps: Int, fps: Int): ByteArray {
         val x0 = ox.coerceAtLeast(0f)
         val y0 = oy.coerceAtLeast(0f)
@@ -89,7 +108,8 @@ class PadView(context: Context, private val sender: Sender) : View(context) {
             oh *= k
         }
         val b = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
-        b.putFloat(x0 / monW).putFloat(y0 / monH).putFloat((x1 - x0) / monW).putFloat((y1 - y0) / monH)
+        val r = stableRegion(floatArrayOf(x0 / monW, y0 / monH, (x1 - x0) / monW, (y1 - y0) / monH))
+        b.putFloat(r[0]).putFloat(r[1]).putFloat(r[2]).putFloat(r[3])
         b.putShort((ow.toInt() and 1.inv()).coerceIn(16, 1920).toShort())
         b.putShort((oh.toInt() and 1.inv()).coerceIn(16, 1920).toShort())
         b.putShort(kbps.coerceIn(300, 20000).toShort())

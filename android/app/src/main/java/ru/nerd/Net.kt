@@ -3,6 +3,10 @@ package ru.nerd
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.SystemClock
 import java.io.DataInputStream
@@ -515,5 +519,38 @@ class Discovery(context: Context) {
             found = seen.filter { now - it.value.second < 4000 }.map { FoundPc(it.value.first, it.key) }
         }
         socket.close()
+    }
+}
+
+// Приложение ходит в сеть через Wi-Fi или кабель напрямую, а не через VPN. Если VPN запрещает обход (так делает
+// большинство), это не сработает: тогда Nerd нужно добавить в исключения самого VPN
+class DirectNetwork(context: Context) {
+    private val cm = context.applicationContext.getSystemService(ConnectivityManager::class.java)
+    private val callback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            runCatching { cm.bindProcessToNetwork(network) }
+        }
+
+        override fun onLost(network: Network) {
+            runCatching { cm.bindProcessToNetwork(null) }
+        }
+    }
+
+    fun start() {
+        runCatching {
+            val request = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build()
+            cm.registerNetworkCallback(request, callback)
+        }
+    }
+
+    fun stop() {
+        runCatching {
+            cm.unregisterNetworkCallback(callback)
+            cm.bindProcessToNetwork(null)
+        }
     }
 }

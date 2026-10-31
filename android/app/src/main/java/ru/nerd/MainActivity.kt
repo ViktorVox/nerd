@@ -92,8 +92,16 @@ private val NerdColors = darkColorScheme(
 )
 
 class MainActivity : ComponentActivity() {
+    private val direct by lazy { DirectNetwork(this) }
+
+    override fun onDestroy() {
+        direct.stop()
+        super.onDestroy()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        direct.start()
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).apply {
             hide(WindowInsetsCompat.Type.systemBars())
